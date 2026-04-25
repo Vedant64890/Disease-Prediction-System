@@ -1,0 +1,14 @@
+{
+  "vedant12345": {
+    "first_name": "vedant",
+    "last_name": "trivedi",
+    "username": "vedant12345",
+    "password_hash": "pbkdf2_sha256$d9447f29c769321ee192a0869c128d98$cf04a1c1cc1a1ca181b26916537e0e4901634644c2d441c67c6fe770ae1fbe52"
+  },
+  "indus1234": {
+    "first_name": "indus",
+    "last_name": "university",
+    "username": "indus1234",
+    "password_hash": "pbkdf2_sha256$d92287ca9e9266087c7178eab2bbd3a8$fc6c78d183944b4deff38604a171113611bf573f3d355eb213661c69969cf846"
+  }
+}
