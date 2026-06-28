@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.agents/
+.codex/
+
+# Local app data and secrets
+disease_prediction.db
+disease_prediction.db-*
+*.sqlite
+*.sqlite3
+.streamlit/secrets.toml
+users.json
+appointments.json
+lab_appointments.json
+
+# Local logs and generated verification output
+*.log
+ui_verification/
