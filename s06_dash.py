@@ -7,11 +7,10 @@ import json
 import os
 import pickle
 import re
-import sqlite3
 from datetime import date, datetime, timedelta
 from math import asin, cos, radians, sin, sqrt
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlencode
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
 import warnings
@@ -27,15 +26,11 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 
 warnings.filterwarnings("ignore")
 
-USERS_FILE = "users.json"
-APPOINTMENTS_FILE = "appointments.json"
-LAB_APPOINTMENTS_FILE = "lab_appointments.json"
-DATABASE_FILE = os.getenv("APP_DATABASE_PATH", "disease_prediction.db")
 ASSISTANT_IMAGE_PATH = os.path.join("assets", "chatbot_launcher.png")
 PATIENT_AVATAR_PATH = os.path.join("assets", "patient_avatar.png")
 THEME_OPTIONS = ("Light", "Dark")
 ASSISTANT_WELCOME_MESSAGE = ""
-ASSISTANT_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+ASSISTANT_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 ASSISTANT_DEFAULT_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{ASSISTANT_DEFAULT_MODEL}:generateContent"
 ASSISTANT_MAX_HISTORY = 12
 ASSISTANT_MIN_PREDICTION_CONFIDENCE = 45.0
@@ -44,6 +39,9 @@ MEDLINEPLUS_SEARCH_URL = "https://wsearch.nlm.nih.gov/ws/query"
 NLM_CONDITIONS_SEARCH_URL = "https://clinicaltables.nlm.nih.gov/api/conditions/v3/search"
 NHS_CONTENT_API_BASE_URL = os.getenv("NHS_CONTENT_API_BASE_URL", "https://api.service.nhs.uk/nhs-website-content").rstrip("/")
 EXTERNAL_EVIDENCE_USER_AGENT = "DiseasePredictionDashboard/1.0"
+MAPBOX_GEOCODING_URL = "https://api.mapbox.com/search/geocode/v6/forward"
+HERE_GEOCODE_URL = "https://geocode.search.hereapi.com/v1/geocode"
+HERE_DISCOVER_URL = "https://discover.search.hereapi.com/v1/discover"
 ASSISTANT_SUPPRESSED_LIVE_ERROR_PATTERNS = (
     r"(?:this|the)\s+model\s+is\s+currently\s+experiencing\s+high\s+demand\.?\s*(?:please\s+try\s+again\s+later\.?)?",
     r"(?:i\s+am|i'm|im)\s+currently\s+experiencing\s+high\s+demand\.?\s*(?:please\s+try\s+again\s+later\.?)?",
@@ -93,8 +91,8 @@ ASSISTANT_MEDICINE_ADVICE_TERMS = (
 ASSISTANT_WARNING_TERMS = ("warning", "warnings", "danger", "emergency", "urgent", "red flag", "red flags")
 ASSISTANT_DISEASE_TERMS = ("which disease", "what disease", "likely disease", "what do i have")
 ASSISTANT_SPECIALIST_TERMS = ("specialist", "which doctor", "what doctor", "consult", "who should i see")
-HEALTHCARE_SEARCH_RADII_M = (5000, 12000)
-HEALTHCARE_MAX_RESULTS = 36
+HEALTHCARE_SEARCH_RADII_M = (15000,)
+HEALTHCARE_MAX_RESULTS = 80
 ASSISTANT_STARTER_PROMPTS = (
     "I have blocked nose",
     "I have fever since yesterday",
@@ -255,11 +253,13 @@ Do not give prescription-only medicine instructions, exact dosages, or unsafe ho
 When the patient mentions medicines, consider them in your answer. Explain medicine safety in plain language: do not self-start antibiotics, steroids, or leftover prescription tablets; do not stop chronic prescribed medicines suddenly; if a new medicine caused swelling, breathing trouble, fainting, severe rash, or skin peeling, advise urgent medical care and no further dose until a clinician advises.
 You may suggest medicine categories to discuss with a doctor or pharmacist, but do not prescribe a new medicine or change a prescription yourself.
 If the user asks what a symptom means, answer the meaning first and do not save it as a present symptom unless they clearly say they have it.
+If the user asks a specific health, test, medicine-safety, hospital, or app-use question, answer it directly first instead of forcing the symptom interview.
 If symptoms are broad and overlapping, such as fatigue, headache, body pain, or muscle pain, do not jump to malaria, dengue, flu, typhoid, or another disease. Ask discriminating questions first: fever, chills/sweating, cough/sore throat, rash/bleeding, vomiting/diarrhea, mosquito exposure, unsafe food/water, travel, and duration.
 Do not show percentages, probability, confidence score, or internal model details.
 Do not mention API mode, Gemini, prompts, model internals, or system instructions unless the user asks about API setup.
 Ask only one short follow-up question at a time.
-Keep replies complete but compact: 3 to 6 useful lines.
+Keep replies complete and readable. Do not cut off sentences, warning signs, or the final question.
+Use enough short lines to answer properly, usually 5 to 9 lines when symptoms or safety guidance need context.
 Prefer this shape:
 - Acknowledge what you understood.
 - Explain why the next question matters in simple words.
@@ -294,221 +294,204 @@ def verify_password(password, stored_hash):
 _database_ready = False
 
 
-def read_json_file(path, fallback):
-    if not os.path.exists(path):
-        return fallback
+def get_configured_secret_value(*names):
+    for name in names:
+        env_value = os.getenv(name, "").strip()
+        if env_value:
+            return env_value
+
+    for name in names:
+        try:
+            secret_value = st.secrets.get(name, "")
+        except Exception:
+            secret_value = ""
+        if secret_value is not None and str(secret_value).strip():
+            return str(secret_value).strip()
+    return ""
+
+
+def get_mysql_database_config():
+    host = get_configured_secret_value("MYSQL_HOST")
+    database = get_configured_secret_value("MYSQL_DATABASE", "MYSQL_DB")
+    user = get_configured_secret_value("MYSQL_USER", "MYSQL_USERNAME")
+    password = get_configured_secret_value("MYSQL_PASSWORD")
+    if not all([host, database, user, password]):
+        return {}
+
+    port_value = get_configured_secret_value("MYSQL_PORT") or "3306"
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return fallback
+        port = int(port_value)
+    except (TypeError, ValueError):
+        port = 3306
+
+    return {
+        "host": host,
+        "port": port,
+        "database": database,
+        "user": user,
+        "password": password,
+    }
 
 
-def get_database_connection():
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+def get_mysql_user_database_config():
+    return get_mysql_database_config()
 
 
-def initialize_database():
-    with get_database_connection() as conn:
-        conn.executescript(
+def mysql_storage_enabled():
+    return bool(get_mysql_database_config())
+
+
+def mysql_user_storage_enabled():
+    return mysql_storage_enabled()
+
+
+def get_mysql_connection():
+    config = get_mysql_database_config()
+    if not config:
+        raise RuntimeError("MySQL storage is not configured.")
+
+    try:
+        import mysql.connector
+    except ImportError as exc:
+        raise RuntimeError(
+            "MySQL storage is configured, but mysql-connector-python is not installed. "
+            "Run: pip install mysql-connector-python"
+        ) from exc
+
+    try:
+        return mysql.connector.connect(**config)
+    except Exception as exc:
+        raise RuntimeError(f"Could not connect to the MySQL database: {exc}") from exc
+
+
+def get_mysql_user_connection():
+    return get_mysql_connection()
+
+
+def initialize_mysql_storage():
+    if not mysql_storage_enabled():
+        return
+
+    conn = get_mysql_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                username TEXT PRIMARY KEY,
-                first_name TEXT NOT NULL,
-                last_name TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS appointments (
-                appointment_id TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                patient_name TEXT NOT NULL,
-                predicted_disease TEXT NOT NULL,
-                specialist TEXT NOT NULL,
-                doctor_name TEXT NOT NULL,
-                hospital TEXT NOT NULL,
-                consultation_mode TEXT NOT NULL,
-                appointment_date TEXT NOT NULL,
-                appointment_slot TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'Booked',
-                booked_at TEXT NOT NULL,
-                symptoms_json TEXT NOT NULL DEFAULT '[]',
-                reason TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_appointments_username
-                ON appointments (username);
-            CREATE INDEX IF NOT EXISTS idx_appointments_slot
-                ON appointments (doctor_name, appointment_date, appointment_slot, status);
-
-            CREATE TABLE IF NOT EXISTS lab_appointments (
-                lab_appointment_id TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                patient_name TEXT NOT NULL,
-                predicted_disease TEXT NOT NULL,
-                lab_name TEXT NOT NULL,
-                lab_tests_json TEXT NOT NULL DEFAULT '[]',
-                total_amount REAL NOT NULL DEFAULT 0,
-                payment_method TEXT NOT NULL,
-                payment_status TEXT NOT NULL,
-                appointment_date TEXT NOT NULL,
-                appointment_slot TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'Booked',
-                booked_at TEXT NOT NULL,
-                symptoms_json TEXT NOT NULL DEFAULT '[]',
-                payment_reference TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_lab_appointments_username
-                ON lab_appointments (username);
-            CREATE INDEX IF NOT EXISTS idx_lab_appointments_slot
-                ON lab_appointments (lab_name, appointment_date, appointment_slot, status);
+                username VARCHAR(120) PRIMARY KEY,
+                first_name VARCHAR(120) NOT NULL,
+                last_name VARCHAR(120) NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appointments (
+                appointment_id VARCHAR(80) PRIMARY KEY,
+                username VARCHAR(120) NOT NULL,
+                patient_name VARCHAR(160) NOT NULL,
+                predicted_disease VARCHAR(160) NOT NULL,
+                specialist VARCHAR(160) NOT NULL,
+                doctor_name VARCHAR(180) NOT NULL,
+                hospital VARCHAR(220) NOT NULL,
+                consultation_mode VARCHAR(80) NOT NULL,
+                appointment_date VARCHAR(20) NOT NULL,
+                appointment_slot VARCHAR(80) NOT NULL,
+                status VARCHAR(40) NOT NULL DEFAULT 'Booked',
+                booked_at VARCHAR(40) NOT NULL,
+                symptoms_json LONGTEXT NOT NULL,
+                reason TEXT NOT NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_appointments_username (username),
+                INDEX idx_appointments_slot (doctor_name, appointment_date, appointment_slot, status)
+            ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lab_appointments (
+                lab_appointment_id VARCHAR(80) PRIMARY KEY,
+                username VARCHAR(120) NOT NULL,
+                patient_name VARCHAR(160) NOT NULL,
+                predicted_disease VARCHAR(160) NOT NULL,
+                lab_name VARCHAR(220) NOT NULL,
+                lab_tests_json LONGTEXT NOT NULL,
+                total_amount DOUBLE NOT NULL DEFAULT 0,
+                payment_method VARCHAR(80) NOT NULL,
+                payment_status VARCHAR(80) NOT NULL,
+                appointment_date VARCHAR(20) NOT NULL,
+                appointment_slot VARCHAR(80) NOT NULL,
+                status VARCHAR(40) NOT NULL DEFAULT 'Booked',
+                booked_at VARCHAR(40) NOT NULL,
+                symptoms_json LONGTEXT NOT NULL,
+                payment_reference VARCHAR(180) NOT NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_lab_appointments_username (username),
+                INDEX idx_lab_appointments_slot (lab_name, appointment_date, appointment_slot, status)
+            ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+        conn.commit()
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
 
 
-def migrate_json_storage_to_database():
-    users = read_json_file(USERS_FILE, {})
-    appointments = read_json_file(APPOINTMENTS_FILE, [])
-    lab_appointments = read_json_file(LAB_APPOINTMENTS_FILE, [])
-
-    with get_database_connection() as conn:
-        for username, user in users.items():
-            username_key = str(user.get("username") or username).strip().lower()
-            if not username_key:
-                continue
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO users (
-                    username, first_name, last_name, password_hash
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (
-                    username_key,
-                    str(user.get("first_name", "")).strip(),
-                    str(user.get("last_name", "")).strip(),
-                    str(user.get("password_hash", "")).strip(),
-                ),
-            )
-
-        for appointment in lab_appointments:
-            appointment_id = str(appointment.get("lab_appointment_id") or appointment.get("appointment_id", "")).strip()
-            username = str(appointment.get("username", "")).strip().lower()
-            if not appointment_id or not username:
-                continue
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO lab_appointments (
-                    lab_appointment_id, username, patient_name, predicted_disease, lab_name,
-                    lab_tests_json, total_amount, payment_method, payment_status,
-                    appointment_date, appointment_slot, status, booked_at, symptoms_json, payment_reference
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    appointment_id,
-                    username,
-                    str(appointment.get("patient_name", "")).strip(),
-                    str(appointment.get("predicted_disease", "")).strip(),
-                    str(appointment.get("lab_name", "")).strip(),
-                    json.dumps(appointment.get("lab_tests", [])),
-                    float(appointment.get("total_amount", 0) or 0),
-                    str(appointment.get("payment_method", "Cash")).strip(),
-                    str(appointment.get("payment_status", "Pending")).strip(),
-                    str(appointment.get("appointment_date", "")).strip(),
-                    str(appointment.get("appointment_slot", "")).strip(),
-                    str(appointment.get("status", "Booked")).strip() or "Booked",
-                    str(appointment.get("booked_at", "")).strip(),
-                    json.dumps(appointment.get("symptoms", [])),
-                    str(appointment.get("payment_reference", "")).strip(),
-                ),
-            )
-
-        for appointment in appointments:
-            appointment_id = str(appointment.get("appointment_id", "")).strip()
-            username = str(appointment.get("username", "")).strip().lower()
-            if not appointment_id or not username:
-                continue
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO appointments (
-                    appointment_id, username, patient_name, predicted_disease, specialist,
-                    doctor_name, hospital, consultation_mode, appointment_date,
-                    appointment_slot, status, booked_at, symptoms_json, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    appointment_id,
-                    username,
-                    str(appointment.get("patient_name", "")).strip(),
-                    str(appointment.get("predicted_disease", "")).strip(),
-                    str(appointment.get("specialist", "")).strip(),
-                    str(appointment.get("doctor_name", "")).strip(),
-                    str(appointment.get("hospital", "")).strip(),
-                    str(appointment.get("consultation_mode", "In-person")).strip(),
-                    str(appointment.get("appointment_date", "")).strip(),
-                    str(appointment.get("appointment_slot", "")).strip(),
-                    str(appointment.get("status", "Booked")).strip() or "Booked",
-                    str(appointment.get("booked_at", "")).strip(),
-                    json.dumps(appointment.get("symptoms", [])),
-                    str(appointment.get("reason", "")).strip(),
-                ),
-            )
+def initialize_mysql_user_storage():
+    initialize_mysql_storage()
 
 
-def ensure_database_ready():
-    global _database_ready
-    if _database_ready:
-        return
-    initialize_database()
-    migrate_json_storage_to_database()
-    _database_ready = True
-
-
-def load_users():
-    ensure_database_ready()
-    with get_database_connection() as conn:
-        rows = conn.execute(
+def load_users_from_mysql():
+    conn = get_mysql_user_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
             """
             SELECT username, first_name, last_name, password_hash
             FROM users
             ORDER BY username
             """
-        ).fetchall()
-
-    return {
-        row["username"]: {
-            "first_name": row["first_name"],
-            "last_name": row["last_name"],
-            "username": row["username"],
-            "password_hash": row["password_hash"],
+        )
+        rows = cursor.fetchall()
+        return {
+            row["username"]: {
+                "first_name": row["first_name"],
+                "last_name": row["last_name"],
+                "username": row["username"],
+                "password_hash": row["password_hash"],
+            }
+            for row in rows
         }
-        for row in rows
-    }
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
 
 
-def save_users(users):
-    ensure_database_ready()
-    with get_database_connection() as conn:
+def save_users_to_mysql(users):
+    conn = get_mysql_user_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor()
         for username, user in users.items():
             username_key = str(user.get("username") or username).strip().lower()
             if not username_key:
                 continue
-            conn.execute(
+            cursor.execute(
                 """
                 INSERT INTO users (
                     username, first_name, last_name, password_hash, updated_at
-                ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(username) DO UPDATE SET
-                    first_name = excluded.first_name,
-                    last_name = excluded.last_name,
-                    password_hash = excluded.password_hash,
+                ) VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON DUPLICATE KEY UPDATE
+                    first_name = VALUES(first_name),
+                    last_name = VALUES(last_name),
+                    password_hash = VALUES(password_hash),
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -518,6 +501,34 @@ def save_users(users):
                     str(user.get("password_hash", "")).strip(),
                 ),
             )
+        conn.commit()
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
+
+
+def ensure_database_ready():
+    global _database_ready
+    if _database_ready:
+        return
+    if not mysql_storage_enabled():
+        raise RuntimeError(
+            "MySQL storage is required. Configure MYSQL_HOST, MYSQL_PORT, "
+            "MYSQL_DATABASE, MYSQL_USER, and MYSQL_PASSWORD in .streamlit/secrets.toml."
+        )
+    initialize_mysql_storage()
+    _database_ready = True
+
+
+def load_users():
+    ensure_database_ready()
+    return load_users_from_mysql()
+
+
+def save_users(users):
+    ensure_database_ready()
+    save_users_to_mysql(users)
 
 
 def get_model_artifact_signature():
@@ -3017,6 +3028,184 @@ def fetch_json_payload(url, data=None, timeout=20, content_type=None):
         return None, f"Location lookup failed: {exc}"
 
 
+def get_configured_mapbox_access_token():
+    env_key = os.getenv("MAPBOX_ACCESS_TOKEN", "").strip()
+    if env_key:
+        return env_key
+
+    try:
+        return str(st.secrets.get("MAPBOX_ACCESS_TOKEN", "")).strip()
+    except Exception:
+        return ""
+
+
+def get_configured_here_api_key():
+    env_key = os.getenv("HERE_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    try:
+        return str(st.secrets.get("HERE_API_KEY", "")).strip()
+    except Exception:
+        return ""
+
+
+def get_map_provider_cache_token():
+    configured_keys = (
+        ("mapbox", get_configured_mapbox_access_token()),
+        ("here", get_configured_here_api_key()),
+    )
+    token_parts = [
+        f"{name}:{hashlib.sha256(value.encode('utf-8')).hexdigest()[:12]}"
+        for name, value in configured_keys
+        if value
+    ]
+    return "|".join(token_parts) if token_parts else "public-map-sources"
+
+
+def extract_map_api_error(payload, provider_name, fallback_message):
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = clean_provider_text(error.get("message"))
+            status = clean_provider_text(error.get("status")) or clean_provider_text(error.get("code"))
+            if message and status:
+                return f"{provider_name} returned {status}: {message}"
+            if message:
+                return f"{provider_name} returned: {message}"
+        if isinstance(error, str):
+            return f"{provider_name} returned: {clean_provider_text(error)}"
+        for key in ("message", "error_message", "title", "cause", "action"):
+            message = clean_provider_text(payload.get(key))
+            if message:
+                return f"{provider_name} returned: {message}"
+    return fallback_message
+
+
+def fetch_map_provider_payload(url, provider_name, timeout=18):
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "DiseasePredictionDashboard/1.0 educational Streamlit app",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8")), ""
+    except HTTPError as exc:
+        raw_error = exc.read().decode("utf-8", errors="replace")
+        try:
+            error_payload = json.loads(raw_error)
+        except json.JSONDecodeError:
+            error_payload = {"error_message": raw_error}
+        return None, extract_map_api_error(
+            error_payload,
+            provider_name,
+            f"{provider_name} returned HTTP {exc.code}.",
+        )
+    except URLError:
+        return None, f"{provider_name} could not be reached."
+    except json.JSONDecodeError:
+        return None, f"{provider_name} returned an unreadable response."
+    except Exception as exc:
+        return None, f"{provider_name} lookup failed: {exc}"
+
+
+def geocode_location_with_mapbox(search_query, access_token):
+    params = {
+        "q": search_query,
+        "access_token": access_token,
+        "country": "in",
+        "language": "en",
+        "limit": 1,
+    }
+    payload, error = fetch_map_provider_payload(
+        f"{MAPBOX_GEOCODING_URL}?{urlencode(params)}",
+        "Mapbox Geocoding",
+        timeout=14,
+    )
+    if error:
+        return None, error
+    if not isinstance(payload, dict):
+        return None, "Mapbox Geocoding returned an unreadable response."
+
+    features = payload.get("features", [])
+    if not features:
+        return None, "Mapbox Geocoding did not find this city or area."
+
+    feature = features[0]
+    properties = feature.get("properties", {}) or {}
+    coordinates = properties.get("coordinates", {}) or {}
+    try:
+        lat = float(coordinates["latitude"])
+        lon = float(coordinates["longitude"])
+    except (KeyError, TypeError, ValueError):
+        geometry_coordinates = feature.get("geometry", {}).get("coordinates", [])
+        try:
+            lon = float(geometry_coordinates[0])
+            lat = float(geometry_coordinates[1])
+        except (IndexError, TypeError, ValueError):
+            return None, "Mapbox location match did not include usable coordinates."
+
+    name = clean_provider_text(properties.get("name"))
+    place = (
+        clean_provider_text(properties.get("full_address"))
+        or clean_provider_text(properties.get("place_formatted"))
+        or clean_provider_text(feature.get("place_name"))
+    )
+    display_name = ", ".join(part for part in (name, place) if part) or clean_provider_text(search_query, "Selected location")
+    return {
+        "lat": lat,
+        "lon": lon,
+        "display_name": display_name,
+        "source": "Mapbox Geocoding",
+    }, ""
+
+
+def geocode_location_with_here(search_query, api_key):
+    params = {
+        "q": search_query,
+        "apikey": api_key,
+        "in": "countryCode:IND",
+        "lang": "en-US",
+        "limit": 1,
+    }
+    payload, error = fetch_map_provider_payload(
+        f"{HERE_GEOCODE_URL}?{urlencode(params)}",
+        "HERE Geocoding",
+        timeout=14,
+    )
+    if error:
+        return None, error
+    if not isinstance(payload, dict):
+        return None, "HERE Geocoding returned an unreadable response."
+
+    items = payload.get("items", [])
+    if not items:
+        return None, "HERE Geocoding did not find this city or area."
+
+    match = items[0]
+    position = match.get("position", {}) or {}
+    try:
+        lat = float(position["lat"])
+        lon = float(position["lng"])
+    except (KeyError, TypeError, ValueError):
+        return None, "HERE location match did not include usable coordinates."
+
+    display_name = (
+        clean_provider_text(match.get("title"))
+        or clean_provider_text((match.get("address") or {}).get("label"))
+        or clean_provider_text(search_query, "Selected location")
+    )
+    return {
+        "lat": lat,
+        "lon": lon,
+        "display_name": display_name,
+        "source": "HERE Geocoding",
+    }, ""
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_india_location_suggestions(location_query, limit=20):
     cleaned_query = normalize_location_query(location_query)
@@ -3076,18 +3265,17 @@ def fetch_india_location_suggestions(location_query, limit=20):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def geocode_location(location_query):
+def geocode_location(location_query, maps_key_token=None):
     cleaned_query = normalize_location_query(location_query)
     if len(cleaned_query) < 2:
         return None, "Please enter at least 2 letters of a city or area."
 
     search_query = cleaned_query
-    if "india" not in search_query:
-        search_query = f"{search_query}, India"
 
+    lookup_errors = []
     nominatim_url = (
         "https://nominatim.openstreetmap.org/search"
-        f"?format=json&limit=1&addressdetails=1&countrycodes=in&q={quote_plus(search_query)}"
+        f"?format=json&limit=1&addressdetails=1&q={quote_plus(search_query)}"
     )
     payload, error = fetch_json_payload(nominatim_url, timeout=14)
     if not error and payload:
@@ -3099,11 +3287,14 @@ def geocode_location(location_query):
                     "lat": float(match["lat"]),
                     "lon": float(match["lon"]),
                     "display_name": display_name,
+                    "source": "OpenStreetMap Nominatim",
                 },
                 "",
             )
         except (KeyError, TypeError, ValueError):
             error = "The matched location did not include usable coordinates."
+    if error:
+        lookup_errors.append(error)
 
     photon_url = (
         "https://photon.komoot.io/api/"
@@ -3130,18 +3321,33 @@ def geocode_location(location_query):
                         "lat": lat,
                         "lon": lon,
                         "display_name": display_name,
+                        "source": "Photon",
                     },
                     "",
                 )
             except (IndexError, TypeError, ValueError):
                 photon_error = "The fallback location match did not include usable coordinates."
-
-    if error and photon_error:
-        return None, f"{error} Fallback lookup also failed: {photon_error}"
-    if error:
-        return None, error
     if photon_error:
-        return None, photon_error
+        lookup_errors.append(photon_error)
+
+    mapbox_token = get_configured_mapbox_access_token()
+    if mapbox_token:
+        mapbox_location, mapbox_error = geocode_location_with_mapbox(search_query, mapbox_token)
+        if mapbox_location:
+            return mapbox_location, ""
+        if mapbox_error:
+            lookup_errors.append(mapbox_error)
+
+    here_api_key = get_configured_here_api_key()
+    if here_api_key:
+        here_location, here_error = geocode_location_with_here(search_query, here_api_key)
+        if here_location:
+            return here_location, ""
+        if here_error:
+            lookup_errors.append(here_error)
+
+    if lookup_errors:
+        return None, " ".join(dict.fromkeys(lookup_errors))
     return None, "No matching city or area was found."
 
 
@@ -3184,7 +3390,7 @@ def fetch_healthcare_elements(lat, lon, radius_m=5000, search_mode="all"):
     else:
         query_body = hospital_queries + doctor_queries
     overpass_query = f"""
-    [out:json][timeout:10];
+    [out:json][timeout:18];
     (
     {query_body}
     );
@@ -3200,7 +3406,7 @@ def fetch_healthcare_elements(lat, lon, radius_m=5000, search_mode="all"):
         payload, error = fetch_json_payload(
             endpoint,
             data=data,
-            timeout=12,
+            timeout=20,
             content_type="application/x-www-form-urlencoded; charset=UTF-8",
         )
         if not error and isinstance(payload, dict):
@@ -3477,15 +3683,13 @@ def build_provider_map_url(name, address, lat, lon):
         lat_value = None
         lon_value = None
 
-    if provider_name and lat_value is not None and lon_value is not None:
-        query = f"{provider_name} {lat_value:.6f},{lon_value:.6f}"
-    elif provider_name and provider_address:
+    if lat_value is not None and lon_value is not None:
+        return f"https://www.openstreetmap.org/?mlat={lat_value:.6f}&mlon={lon_value:.6f}#map=17/{lat_value:.6f}/{lon_value:.6f}"
+    if provider_name and provider_address:
         query = f"{provider_name}, {provider_address}"
-    elif lat_value is not None and lon_value is not None:
-        query = f"{lat_value:.6f},{lon_value:.6f}"
     else:
         query = provider_name or provider_address or "hospital"
-    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(query)}"
+    return f"https://www.openstreetmap.org/search?query={quote_plus(query)}"
 
 
 def build_osm_provider_url(element):
@@ -3587,6 +3791,7 @@ def extract_provider_from_osm(element, origin_lat, origin_lon, specialist, disea
         "maps_url": build_provider_map_url(provider_name, provider_address, lat, lon),
         "osm_url": build_osm_provider_url(element),
         "location_label": "Map coordinate available",
+        "source": "OpenStreetMap",
         "search_text": provider_text,
     }
 
@@ -3678,6 +3883,7 @@ def extract_lab_provider_from_photon(feature, origin_lat, origin_lon, specialist
         "maps_url": build_provider_map_url(provider_name, provider_address, lat, lon),
         "osm_url": osm_url,
         "location_label": "Map coordinate available",
+        "source": "Photon",
         "search_text": provider_text,
     }
 
@@ -3722,13 +3928,249 @@ def search_diagnostic_labs_with_photon(location_query, origin_lat, origin_lon, s
     return providers[:10], errors[-1] if errors and not providers else ""
 
 
+def get_here_category_names(item):
+    categories = item.get("categories", [])
+    if not isinstance(categories, list):
+        return []
+    return [
+        clean_provider_text(category.get("name"))
+        for category in categories
+        if isinstance(category, dict) and clean_provider_text(category.get("name"))
+    ]
+
+
+def classify_here_place_provider(item, search_mode):
+    category_names = get_here_category_names(item)
+    address_label = clean_provider_text((item.get("address") or {}).get("label"))
+    combined = normalize_text_for_matching(
+        f"{item.get('title', '')} {address_label} {' '.join(category_names)} {item.get('resultType', '')}"
+    )
+    if any(term in combined for term in ("medical lab", "diagnostic", "pathology", "laboratory", "radiology", "imaging", "scan")):
+        return "Diagnostic Lab"
+    if "hospital" in combined:
+        return "Hospital"
+    if "doctor" in combined or "physician" in combined:
+        return "Doctor"
+    if "clinic" in combined or "health center" in combined or "health centre" in combined:
+        return "Clinic"
+    if search_mode == "hospitals":
+        return "Hospital"
+    if search_mode == "labs":
+        return "Diagnostic Lab"
+    if search_mode == "doctors":
+        return "Clinic"
+    return "Healthcare"
+
+
+def get_here_opening_summary(item):
+    opening = item.get("openingHours")
+    if isinstance(opening, dict):
+        opening_entries = [opening]
+    elif isinstance(opening, list):
+        opening_entries = [entry for entry in opening if isinstance(entry, dict)]
+    else:
+        opening_entries = []
+
+    for entry in opening_entries:
+        if entry.get("isOpen") is True:
+            return "Open now"
+        if entry.get("isOpen") is False:
+            return "Closed now"
+        text_value = entry.get("text")
+        if isinstance(text_value, list) and text_value:
+            return clean_provider_text(text_value[0], "Hours listed")
+        if clean_provider_text(text_value):
+            return clean_provider_text(text_value, "Hours listed")
+    return ""
+
+
+def get_here_contact_details(item):
+    phone = ""
+    website = ""
+    contacts = item.get("contacts", [])
+    if not isinstance(contacts, list):
+        return phone, website
+
+    for contact in contacts:
+        if not isinstance(contact, dict):
+            continue
+        for phone_entry in contact.get("phone", []) or []:
+            if isinstance(phone_entry, dict):
+                phone = phone or clean_provider_text(phone_entry.get("value"))
+            else:
+                phone = phone or clean_provider_text(phone_entry)
+        for web_entry in contact.get("www", []) or []:
+            if isinstance(web_entry, dict):
+                website = website or clean_provider_text(web_entry.get("value"))
+            else:
+                website = website or clean_provider_text(web_entry)
+        if phone and website:
+            break
+    return phone, website
+
+
+def extract_provider_from_here_place(item, origin_lat, origin_lon, specialist, disease_name, search_mode):
+    if not isinstance(item, dict):
+        return None
+
+    provider_name = clean_provider_text(item.get("title"))
+    if not provider_name:
+        return None
+
+    position = item.get("position", {}) or {}
+    try:
+        lat = float(position["lat"])
+        lon = float(position["lng"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    category_names = get_here_category_names(item)
+    provider_address = clean_provider_text(
+        (item.get("address") or {}).get("label"),
+        "Address not published by map provider",
+    )
+    kind = classify_here_place_provider(item, search_mode)
+    primary_type = category_names[0] if category_names else clean_provider_text(specialist, "Healthcare")
+    provider_text = normalize_text_for_matching(
+        f"{provider_name} {provider_address} {primary_type} {' '.join(category_names)}"
+    )
+    distance_km = calculate_distance_km(origin_lat, origin_lon, lat, lon)
+    score, match_label = score_provider_match(provider_text, kind, distance_km, specialist, disease_name)
+    rating = clean_provider_number(item.get("averageRating") or item.get("rating"), None)
+    if rating:
+        score = min(99, score + min(max(rating - 3.5, 0) * 4, 8))
+
+    phone, website = get_here_contact_details(item)
+    return {
+        "name": provider_name,
+        "kind": kind,
+        "address": provider_address,
+        "distance_km": round(distance_km, 1),
+        "score": round(score),
+        "match_label": match_label,
+        "phone": phone,
+        "website": website,
+        "opening_hours": get_here_opening_summary(item),
+        "speciality": primary_type,
+        "lat": lat,
+        "lon": lon,
+        "maps_url": build_provider_map_url(provider_name, provider_address, lat, lon),
+        "osm_url": "",
+        "place_id": clean_provider_text(item.get("id")),
+        "rating": rating,
+        "user_rating_count": int(clean_provider_number(item.get("reviewCount"), 0)),
+        "location_label": "HERE location match",
+        "source": "HERE",
+        "search_text": provider_text,
+    }
+
+
+def build_healthcare_search_queries(location_query, specialist, disease_name, search_mode):
+    location_label = clean_provider_text(location_query, "nearby")
+    specialist_label = clean_provider_text(specialist, "doctor")
+    disease_label = clean_provider_text(disease_name)
+    care_focus = get_provider_care_focus(specialist, disease_name)
+
+    if search_mode == "hospitals":
+        queries = [
+            f"{specialist_label} hospital near {location_label}",
+            f"{care_focus} hospital near {location_label}",
+            f"best hospital near {location_label}",
+        ]
+    elif search_mode == "doctors":
+        queries = [
+            f"{specialist_label} doctor near {location_label}",
+            f"{specialist_label} clinic near {location_label}",
+            f"{care_focus} doctor near {location_label}",
+        ]
+    elif search_mode == "labs":
+        queries = [
+            f"diagnostic lab near {location_label}",
+            f"pathology laboratory near {location_label}",
+            f"radiology imaging center near {location_label}",
+        ]
+    else:
+        queries = [
+            f"{specialist_label} doctor near {location_label}",
+            f"{specialist_label} hospital near {location_label}",
+            f"{care_focus} healthcare near {location_label}",
+        ]
+
+    if disease_label and search_mode in {"all", "doctors", "hospitals"}:
+        queries.insert(0, f"{disease_label} {specialist_label} near {location_label}")
+
+    unique_queries = []
+    seen = set()
+    for query in queries:
+        normalized_query = normalize_text_for_matching(query)
+        if normalized_query and normalized_query not in seen:
+            unique_queries.append(query)
+            seen.add(normalized_query)
+    return unique_queries
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_healthcare_places_with_here(location_query, origin_lat, origin_lon, specialist, disease_name, search_mode="all", maps_key_token=None):
+    api_key = get_configured_here_api_key()
+    if not api_key:
+        return [], "", 0
+
+    providers = []
+    errors = []
+    search_radius_m = HEALTHCARE_SEARCH_RADII_M[-1]
+    for query in build_healthcare_search_queries(location_query, specialist, disease_name, search_mode):
+        params = {
+            "q": query,
+            "at": f"{float(origin_lat):.6f},{float(origin_lon):.6f}",
+            "limit": 20,
+            "lang": "en-US",
+            "apikey": api_key,
+        }
+        response_payload, error = fetch_map_provider_payload(
+            f"{HERE_DISCOVER_URL}?{urlencode(params)}",
+            "HERE Search",
+            timeout=18,
+        )
+        if error:
+            errors.append(error)
+            continue
+        if not isinstance(response_payload, dict):
+            continue
+
+        for item in response_payload.get("items", []):
+            provider = extract_provider_from_here_place(
+                item,
+                origin_lat,
+                origin_lon,
+                specialist,
+                disease_name,
+                search_mode,
+            )
+            if provider:
+                providers.append(provider)
+
+    providers = dedupe_provider_results(providers)
+    care_focus = get_provider_care_focus(specialist, disease_name)
+    if search_mode != "labs":
+        providers = [
+            provider for provider in providers if provider_is_relevant_for_care_focus(provider, care_focus, disease_name)
+        ]
+    providers.sort(key=lambda item: (-item["score"], item["distance_km"], item["name"]))
+    return providers[:25], errors[-1] if errors and not providers else "", search_radius_m
+
+
 def dedupe_provider_results(providers):
     unique = {}
     for provider in providers:
-        key = (
-            normalize_text_for_matching(provider["name"]),
-            normalize_text_for_matching(provider["address"])[:50],
-        )
+        place_id = clean_provider_text(provider.get("place_id"))
+        if place_id:
+            source_name = normalize_text_for_matching(provider.get("source")) or "map-provider"
+            key = (source_name, place_id)
+        else:
+            key = (
+                normalize_text_for_matching(provider["name"]),
+                normalize_text_for_matching(provider["address"])[:50],
+            )
         previous = unique.get(key)
         if not previous or (provider["score"], -provider["distance_km"]) > (previous["score"], -previous["distance_km"]):
             unique[key] = provider
@@ -3778,13 +4220,7 @@ def provider_is_relevant_for_care_focus(provider, care_focus, disease_name=""):
     if provider.get("kind") == "Diagnostic Lab":
         return True
     if provider.get("kind") == "Hospital":
-        if "clinic" in name_text and "hospital" not in name_text:
-            return False
-        if "diagnostic" in focus_keys and "hospital" not in name_text:
-            return False
-        if not focus_keys or focus_keys & compatible_focuses:
-            return True
-        return False
+        return True
 
     focus = normalize_text_for_matching(care_focus)
     if "fever and infection" in focus:
@@ -3807,12 +4243,60 @@ def provider_is_relevant_for_care_focus(provider, care_focus, disease_name=""):
     return True
 
 
+def split_provider_result_groups(providers):
+    doctors = [
+        provider
+        for provider in providers
+        if provider.get("kind") in {"Doctor", "Clinic", "Healthcare"}
+    ]
+    hospitals = [provider for provider in providers if provider.get("kind") == "Hospital"]
+    labs = [provider for provider in providers if provider.get("kind") == "Diagnostic Lab"]
+    doctors.sort(key=lambda item: (-item["score"], item["distance_km"], item["name"]))
+    hospitals.sort(key=lambda item: (-item["score"], item["distance_km"], item["name"]))
+    labs.sort(key=lambda item: (-item["score"], item["distance_km"], item["name"]))
+    return doctors, hospitals, labs
+
+
+def provider_groups_match_search_mode(search_mode, doctors, hospitals, labs):
+    if search_mode == "doctors":
+        return bool(doctors)
+    if search_mode == "hospitals":
+        return bool(hospitals)
+    if search_mode == "labs":
+        return bool(labs)
+    return bool(doctors or hospitals or labs)
+
+
+def build_healthcare_search_result(
+    geocoded_location,
+    providers,
+    search_radius_m,
+    search_mode,
+    care_focus,
+    source,
+    error="",
+):
+    doctors, hospitals, labs = split_provider_result_groups(providers)
+    return {
+        "ok": bool(doctors or hospitals or labs),
+        "error": error if not (doctors or hospitals or labs) else "",
+        "origin": geocoded_location,
+        "doctors": doctors,
+        "hospitals": hospitals,
+        "labs": labs,
+        "search_radius_m": search_radius_m,
+        "search_mode": search_mode,
+        "care_focus": care_focus,
+        "source": source,
+    }
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def search_nearby_healthcare(location_query, specialist, disease_name, search_mode="all"):
+def search_nearby_healthcare(location_query, specialist, disease_name, search_mode="all", maps_key_token=None):
     search_mode = clean_provider_text(search_mode, "all").lower()
     if search_mode not in {"all", "doctors", "hospitals", "labs"}:
         search_mode = "all"
-    geocoded_location, geocode_error = geocode_location(location_query)
+    geocoded_location, geocode_error = geocode_location(location_query, maps_key_token)
     if geocode_error:
         return {
             "ok": False,
@@ -3825,6 +4309,9 @@ def search_nearby_healthcare(location_query, specialist, disease_name, search_mo
             "search_mode": search_mode,
         }
 
+    care_focus = "Diagnostic lab" if search_mode == "labs" else get_provider_care_focus(specialist, disease_name)
+    provider_errors = []
+
     if search_mode == "labs":
         photon_labs, photon_error = search_diagnostic_labs_with_photon(
             location_query,
@@ -3835,25 +4322,19 @@ def search_nearby_healthcare(location_query, specialist, disease_name, search_mo
         )
         if photon_labs:
             search_radius_m = int(max(provider.get("distance_km", 0) for provider in photon_labs) * 1000) or HEALTHCARE_SEARCH_RADII_M[0]
-            return {
-                "ok": True,
-                "error": "",
-                "origin": geocoded_location,
-                "doctors": [],
-                "hospitals": [],
-                "labs": photon_labs,
-                "search_radius_m": search_radius_m,
-                "search_mode": search_mode,
-                "care_focus": "Diagnostic lab",
-                "source": "OpenStreetMap public diagnostic listings",
-            }
-    else:
-        photon_error = ""
+            return build_healthcare_search_result(
+                geocoded_location,
+                photon_labs,
+                search_radius_m,
+                search_mode,
+                "Diagnostic lab",
+                "Photon/OpenStreetMap public diagnostic listings",
+            )
+        if photon_error:
+            provider_errors.append(photon_error)
 
     providers = []
-    provider_errors = [photon_error] if photon_error else []
     search_radius_m = HEALTHCARE_SEARCH_RADII_M[0]
-    care_focus = get_provider_care_focus(specialist, disease_name)
     for radius_m in HEALTHCARE_SEARCH_RADII_M:
         elements, provider_error = fetch_healthcare_elements(
             geocoded_location["lat"],
@@ -3892,29 +4373,53 @@ def search_nearby_healthcare(location_query, specialist, disease_name, search_mo
             break
 
     providers = [provider for provider in providers if provider_is_relevant_for_care_focus(provider, care_focus, disease_name)]
-    doctors = [
-        provider
-        for provider in providers
-        if provider["kind"] in {"Doctor", "Clinic", "Healthcare"}
-    ]
-    hospitals = [provider for provider in providers if provider["kind"] == "Hospital"]
-    labs = [provider for provider in providers if provider["kind"] == "Diagnostic Lab"]
-    doctors.sort(key=lambda item: (-item["score"], item["distance_km"], item["name"]))
-    hospitals.sort(key=lambda item: (-item["score"], item["distance_km"], item["name"]))
-    labs.sort(key=lambda item: (-item["score"], item["distance_km"], item["name"]))
+    doctors, hospitals, labs = split_provider_result_groups(providers)
+    if provider_groups_match_search_mode(search_mode, doctors, hospitals, labs):
+        return build_healthcare_search_result(
+            geocoded_location,
+            providers,
+            search_radius_m,
+            search_mode,
+            care_focus,
+            "OpenStreetMap public healthcare listings",
+        )
 
-    return {
-        "ok": bool(doctors or hospitals or labs),
-        "error": provider_errors[-1] if provider_errors and not providers else "",
-        "origin": geocoded_location,
-        "doctors": doctors[:8],
-        "hospitals": hospitals[:6],
-        "labs": labs[:10],
-        "search_radius_m": search_radius_m,
-        "search_mode": search_mode,
-        "care_focus": care_focus,
-        "source": "OpenStreetMap public healthcare listings",
-    }
+    here_providers, here_error, here_radius_m = search_healthcare_places_with_here(
+        location_query,
+        geocoded_location["lat"],
+        geocoded_location["lon"],
+        specialist,
+        disease_name,
+        search_mode,
+        maps_key_token,
+    )
+    if here_error:
+        provider_errors.append(here_error)
+    if here_providers:
+        combined_providers = dedupe_provider_results(providers + here_providers)
+        combined_providers = [
+            provider for provider in combined_providers if provider_is_relevant_for_care_focus(provider, care_focus, disease_name)
+        ]
+        combined_doctors, combined_hospitals, combined_labs = split_provider_result_groups(combined_providers)
+        if provider_groups_match_search_mode(search_mode, combined_doctors, combined_hospitals, combined_labs):
+            return build_healthcare_search_result(
+                geocoded_location,
+                combined_providers,
+                here_radius_m or search_radius_m,
+                search_mode,
+                care_focus,
+                "OpenStreetMap public listings + HERE fallback",
+            )
+
+    return build_healthcare_search_result(
+        geocoded_location,
+        providers,
+        search_radius_m,
+        search_mode,
+        care_focus,
+        "OpenStreetMap public healthcare listings",
+        provider_errors[-1] if provider_errors and not providers else "",
+    )
 
 
 def build_provider_card_html(provider):
@@ -3932,9 +4437,17 @@ def build_provider_card_html(provider):
         provider.get("lon"),
     )
     osm_url = clean_provider_text(provider.get("osm_url"))
+    source_name = clean_provider_text(provider.get("source"))
     phone = clean_provider_text(provider.get("phone"))
     opening_hours = clean_provider_text(provider.get("opening_hours"))
     website = clean_provider_text(provider.get("website"))
+    rating = clean_provider_number(provider.get("rating"), None)
+    user_rating_count = int(clean_provider_number(provider.get("user_rating_count"), 0))
+    if rating:
+        if user_rating_count:
+            contact_lines.append(f"Rating: {rating:.1f} ({user_rating_count} Google reviews)")
+        else:
+            contact_lines.append(f"Rating: {rating:.1f}")
     if phone:
         contact_lines.append(f"Phone: {html.escape(phone)}")
     if opening_hours:
@@ -3944,11 +4457,13 @@ def build_provider_card_html(provider):
         if website_url and not re.match(r"^https?://", website_url, flags=re.IGNORECASE):
             website_url = f"https://{website_url}"
         contact_lines.append("Website listed")
+    if source_name:
+        contact_lines.append(f"Source: {html.escape(source_name)}")
     if osm_url:
         contact_lines.append("OSM source")
     contact_html = "".join(f"<span>{line}</span>" for line in contact_lines)
     if not contact_html:
-        contact_html = "<span>Contact details not published in public map data</span>"
+        contact_html = "<span>Contact details not published in map data</span>"
 
     if provider_kind == "Diagnostic Lab":
         map_cta = "Open lab location"
@@ -4586,6 +5101,12 @@ def extract_duration_detail(message_text):
         return f"{number_words[word_duration_match.group(1)]} {word_duration_match.group(2)}"
 
     relative_patterns = (
+        ("last few days", "a few days"),
+        ("few days ago", "a few days"),
+        ("few days", "a few days"),
+        ("couple of days", "a couple of days"),
+        ("couple days", "a couple of days"),
+        ("several days", "several days"),
         ("since yesterday", "since yesterday"),
         ("from yesterday", "since yesterday"),
         ("yesterday", "since yesterday"),
@@ -5225,6 +5746,13 @@ def resolve_pending_question_answer(message_text, feature_names):
             result["error"] = "Please describe the symptom, or say 'no' if you don't have any others."
 
     if not is_valid:
+        context_update = extract_clinical_note_update(message_text, feature_names)
+        if has_clinical_detail(context_update):
+            result["note_update"] = merge_note_updates(result.get("note_update", {}), context_update)
+            result["error"] = None
+            is_valid = True
+
+    if not is_valid:
         st.session_state.assistant_pending_question = pending
 
     return result
@@ -5799,13 +6327,21 @@ def build_patient_conversation_reply(user_message, detected_now, cumulative_symp
 
     reasoning_line = get_symptom_reasoning_line(cumulative_symptoms, notes, preview, None)
     parts = [intro]
+    if cumulative_symptoms:
+        parts.append(f"Saved symptoms: {format_symptom_summary(cumulative_symptoms)}.")
     if reasoning_line and reasoning_line != intro:
         parts.append(reasoning_line)
+    if preview:
+        parts.append("I am using this as screening support, not a confirmed diagnosis.")
+    elif cumulative_symptoms:
+        parts.append("I need a little more detail before the screening result will be useful.")
     medicine_guidance = build_medicine_safety_guidance(notes, cumulative_symptoms, care_plan)
     if medicine_guidance and medicine_guidance not in parts:
         parts.append(medicine_guidance)
     if urgent_note:
         parts.append(urgent_note)
+    elif cumulative_symptoms:
+        parts.append("If symptoms become severe, sudden, or rapidly worse, please seek medical care promptly.")
     if question:
         parts.append(question)
     return "\n\n".join(parts)
@@ -6834,11 +7370,21 @@ def extract_gemini_response_text(payload):
     return ""
 
 
-def call_live_chat_model(chat_history, cumulative_symptoms, preview, notes=None):
+def call_live_chat_model(chat_history, cumulative_symptoms, preview, notes=None, local_reply=""):
     api_key = get_configured_gemini_api_key()
 
     if not api_key:
         return "", "Gemini mode is not configured yet. Set GEMINI_API_KEY in `.streamlit/secrets.toml` to enable live replies."
+
+    live_context = build_live_ai_context(cumulative_symptoms, preview, notes)
+    if local_reply:
+        live_context = (
+            f"{live_context}\n\n"
+            "App draft reply to merge with Gemini useful detail:\n"
+            f"{strip_live_ai_noise(local_reply)[:1600]}\n"
+            "- Keep the same final follow-up question as the app draft if it asks one. "
+            "Do not ask a different final follow-up question."
+        )
 
     payload = {
         "systemInstruction": {
@@ -6846,7 +7392,7 @@ def call_live_chat_model(chat_history, cumulative_symptoms, preview, notes=None)
                 {
                     "text": (
                         f"{ASSISTANT_SYSTEM_PROMPT}\n\n"
-                        f"{build_live_ai_context(cumulative_symptoms, preview, notes)}"
+                        f"{live_context}"
                     )
                 }
             ]
@@ -6854,7 +7400,7 @@ def call_live_chat_model(chat_history, cumulative_symptoms, preview, notes=None)
         "contents": build_gemini_contents(chat_history),
         "generationConfig": {
             "temperature": 0.35,
-            "maxOutputTokens": 850,
+            "maxOutputTokens": 1600,
         },
     }
     headers = {
@@ -6894,6 +7440,145 @@ def call_live_chat_model(chat_history, cumulative_symptoms, preview, notes=None)
         response_payload,
         "The Gemini model responded, but no assistant text was returned.",
     )
+
+
+def infer_visible_question_type(reply_text):
+    normalized_reply = normalize_text_for_matching(reply_text)
+    if "?" not in str(reply_text) and not any(term in normalized_reply for term in ("tell me", "could you", "can you")):
+        return ""
+
+    if any(
+        term in normalized_reply
+        for term in (
+            "how long",
+            "how many days",
+            "how many hours",
+            "since when",
+            "from when",
+            "when did",
+            "when first",
+            "first noticed",
+            "first notice",
+            "approximately when",
+            "was it today",
+            "was it yesterday",
+        )
+    ):
+        return "duration"
+
+    if any(
+        term in normalized_reply
+        for term in (
+            "getting better",
+            "getting worse",
+            "staying the same",
+            "stay the same",
+            "same or worse",
+            "improving",
+            "worsening",
+            "progression",
+            "changed over time",
+        )
+    ):
+        return "progression"
+
+    if any(term in normalized_reply for term in ("mild moderate or severe", "mild moderate severe", "how severe", "severity")):
+        return "severity"
+
+    if any(term in normalized_reply for term in ("temperature", "how much was it", "checked it")):
+        return "temperature"
+
+    if any(term in normalized_reply for term in ("taken any medicine", "which medicine", "medicine for this", "paracetamol", "tablet")):
+        return "medicine"
+
+    if all(term in normalized_reply for term in ("asthma", "diabetes")) and any(term in normalized_reply for term in ("pregnancy", "heart", "high bp", "low immunity")):
+        return "risk_context"
+
+    return ""
+
+
+def sync_pending_question_with_visible_reply(reply_text, cumulative_symptoms, notes=None):
+    visible_question_type = infer_visible_question_type(reply_text)
+    if not visible_question_type:
+        return
+
+    current_pending = dict(st.session_state.get("assistant_pending_question", {}) or {})
+    if current_pending.get("type") == visible_question_type:
+        return
+
+    current_key = current_pending.get("key")
+    if current_key:
+        asked_keys = list(st.session_state.get("assistant_asked_question_keys", []) or [])
+        st.session_state.assistant_asked_question_keys = [key for key in asked_keys if key != current_key]
+
+    profile = get_symptom_question_profile(cumulative_symptoms or [])
+    profile_name = profile.get("name", "current symptoms")
+    remember_assistant_question(f"visible:{visible_question_type}:{profile_name}", visible_question_type)
+
+
+def extract_last_question(text):
+    matches = re.findall(r"([^?]{4,}\?)", str(text or ""), flags=re.MULTILINE)
+    if not matches:
+        return ""
+    return re.sub(r"\s+", " ", matches[-1]).strip()
+
+
+def get_missing_local_guidance_lines(live_reply, fallback_reply, limit=6):
+    live_normalized = normalize_text_for_matching(live_reply)
+    missing_lines = []
+    for raw_line in str(fallback_reply or "").splitlines():
+        line = raw_line.strip()
+        if not line or "?" in line:
+            continue
+        if line.endswith(":"):
+            continue
+        normalized_line = normalize_text_for_matching(line)
+        if not normalized_line or len(normalized_line) < 12:
+            continue
+        if normalized_line in live_normalized:
+            continue
+        missing_lines.append(line)
+        if len(missing_lines) >= limit:
+            break
+    return missing_lines
+
+
+def merge_live_and_local_chat_reply(live_reply, fallback_reply):
+    live_reply = strip_live_ai_noise(live_reply)
+    fallback_reply = strip_live_ai_noise(fallback_reply)
+    if not live_reply:
+        return fallback_reply
+    if not fallback_reply:
+        return live_reply
+
+    merged_reply = live_reply
+    if reply_needs_more_detail(live_reply):
+        missing_lines = get_missing_local_guidance_lines(live_reply, fallback_reply)
+        if missing_lines:
+            merged_reply = (
+                f"{merged_reply}\n\n"
+                "Also keep in mind:\n"
+                + "\n".join(missing_lines)
+            )
+
+    if "?" not in merged_reply:
+        local_question = extract_last_question(fallback_reply)
+        if local_question:
+            merged_reply = f"{merged_reply}\n\n{local_question}"
+
+    return merged_reply.strip()
+
+
+def get_live_or_fallback_chat_reply(chat_history, fallback_reply, cumulative_symptoms, preview, notes=None, action=None):
+    if action in {"load", "predict"}:
+        return fallback_reply
+
+    live_reply, _ = call_live_chat_model(chat_history, cumulative_symptoms, preview, notes, fallback_reply)
+    if live_reply:
+        merged_reply = merge_live_and_local_chat_reply(live_reply, fallback_reply)
+        sync_pending_question_with_visible_reply(merged_reply, cumulative_symptoms, notes)
+        return merged_reply
+    return fallback_reply
 
 
 def build_symptom_assistant_reply(user_message, detected_now, cumulative_symptoms, model, label_encoder, feature_names):
@@ -7072,8 +7757,19 @@ def process_symptom_assistant_message(message_text, model, label_encoder, featur
     information_symptoms = detect_symptom_information_request(cleaned_message, feature_names)
     if information_symptoms:
         st.session_state.symptom_chat_history.append({"role": "user", "content": cleaned_message})
+        clinical_notes = st.session_state.get("assistant_clinical_notes", {}) or {}
+        current_symptoms = st.session_state.get("assistant_detected_symptoms", []) or []
+        preview = get_assistant_reference_prediction(model, label_encoder, feature_names, current_symptoms)
+        fallback_reply = build_symptom_information_reply(information_symptoms)
+        assistant_reply = get_live_or_fallback_chat_reply(
+            st.session_state.symptom_chat_history,
+            fallback_reply,
+            current_symptoms,
+            preview,
+            clinical_notes,
+        )
         st.session_state.symptom_chat_history.append(
-            {"role": "assistant", "content": build_symptom_information_reply(information_symptoms)}
+            {"role": "assistant", "content": assistant_reply}
         )
         return ""
 
@@ -7095,6 +7791,7 @@ def process_symptom_assistant_message(message_text, model, label_encoder, featur
 
     normalized_message = normalize_text_for_matching(cleaned_message)
     action = pending_result.get("action") or detect_assistant_action(normalized_message, merged_symptoms)
+    preview = get_assistant_reference_prediction(model, label_encoder, feature_names, merged_symptoms)
 
     fallback_reply = build_symptom_assistant_reply(
         cleaned_message,
@@ -7184,6 +7881,15 @@ def process_symptom_assistant_message(message_text, model, label_encoder, featur
                     "I could not run the screening from the current details yet. "
                     "Please add one more clear symptom or duration, then type 'predict now' again."
                 )
+    else:
+        assistant_reply = get_live_or_fallback_chat_reply(
+            st.session_state.symptom_chat_history,
+            fallback_reply,
+            merged_symptoms,
+            preview,
+            clinical_notes,
+            action=action,
+        )
 
     st.session_state.symptom_chat_history.append({"role": "assistant", "content": assistant_reply})
     return ""
@@ -8506,8 +9212,8 @@ def inject_custom_styles():
             gap: 0.7rem;
             width: 100%;
             min-height: 240px;
-            max-height: clamp(340px, 52vh, 520px);
-            overflow-y: auto;
+            max-height: none;
+            overflow-y: visible;
             overflow-x: hidden;
             padding: 0.85rem;
             margin: 0.6rem 0 0.85rem;
@@ -10837,7 +11543,8 @@ def inject_custom_styles():
 
             .assistant-chat-history {
                 min-height: 260px !important;
-                max-height: 58vh !important;
+                max-height: none !important;
+                overflow-y: visible !important;
                 padding: 0.65rem !important;
             }
 
@@ -11992,10 +12699,12 @@ def appointment_row_to_dict(row):
     }
 
 
-def load_appointments():
-    ensure_database_ready()
-    with get_database_connection() as conn:
-        rows = conn.execute(
+def load_appointments_from_mysql():
+    conn = get_mysql_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
             """
             SELECT appointment_id, username, patient_name, predicted_disease, specialist,
                    doctor_name, hospital, consultation_mode, appointment_date,
@@ -12003,39 +12712,45 @@ def load_appointments():
             FROM appointments
             ORDER BY appointment_date DESC, appointment_slot DESC, booked_at DESC
             """
-        ).fetchall()
-    return [appointment_row_to_dict(row) for row in rows]
+        )
+        return [appointment_row_to_dict(row) for row in cursor.fetchall()]
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
 
 
-def save_appointments(appointments):
-    ensure_database_ready()
-    with get_database_connection() as conn:
+def save_appointments_to_mysql(appointments):
+    conn = get_mysql_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor()
         for appointment in appointments:
             appointment_id = str(appointment.get("appointment_id", "")).strip()
             username = str(appointment.get("username", "")).strip().lower()
             if not appointment_id or not username:
                 continue
-            conn.execute(
+            cursor.execute(
                 """
                 INSERT INTO appointments (
                     appointment_id, username, patient_name, predicted_disease, specialist,
                     doctor_name, hospital, consultation_mode, appointment_date,
                     appointment_slot, status, booked_at, symptoms_json, reason, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(appointment_id) DO UPDATE SET
-                    username = excluded.username,
-                    patient_name = excluded.patient_name,
-                    predicted_disease = excluded.predicted_disease,
-                    specialist = excluded.specialist,
-                    doctor_name = excluded.doctor_name,
-                    hospital = excluded.hospital,
-                    consultation_mode = excluded.consultation_mode,
-                    appointment_date = excluded.appointment_date,
-                    appointment_slot = excluded.appointment_slot,
-                    status = excluded.status,
-                    booked_at = excluded.booked_at,
-                    symptoms_json = excluded.symptoms_json,
-                    reason = excluded.reason,
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON DUPLICATE KEY UPDATE
+                    username = VALUES(username),
+                    patient_name = VALUES(patient_name),
+                    predicted_disease = VALUES(predicted_disease),
+                    specialist = VALUES(specialist),
+                    doctor_name = VALUES(doctor_name),
+                    hospital = VALUES(hospital),
+                    consultation_mode = VALUES(consultation_mode),
+                    appointment_date = VALUES(appointment_date),
+                    appointment_slot = VALUES(appointment_slot),
+                    status = VALUES(status),
+                    booked_at = VALUES(booked_at),
+                    symptoms_json = VALUES(symptoms_json),
+                    reason = VALUES(reason),
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -12055,45 +12770,83 @@ def save_appointments(appointments):
                     str(appointment.get("reason", "")).strip(),
                 ),
             )
+        conn.commit()
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
+
+
+def load_appointments():
+    ensure_database_ready()
+    return load_appointments_from_mysql()
+
+
+def save_appointments(appointments):
+    ensure_database_ready()
+    save_appointments_to_mysql(appointments)
 
 
 def save_appointment(appointment):
     save_appointments([appointment])
 
 
-def is_appointment_slot_taken(doctor_name, appointment_date, appointment_slot):
-    ensure_database_ready()
-    with get_database_connection() as conn:
-        row = conn.execute(
+def is_appointment_slot_taken_in_mysql(doctor_name, appointment_date, appointment_slot):
+    conn = get_mysql_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
             """
             SELECT 1
             FROM appointments
-            WHERE lower(trim(doctor_name)) = lower(trim(?))
-              AND appointment_date = ?
-              AND lower(trim(appointment_slot)) = lower(trim(?))
+            WHERE lower(trim(doctor_name)) = lower(trim(%s))
+              AND appointment_date = %s
+              AND lower(trim(appointment_slot)) = lower(trim(%s))
               AND status = 'Booked'
             LIMIT 1
             """,
             (doctor_name, appointment_date, appointment_slot),
-        ).fetchone()
-    return row is not None
+        )
+        return cursor.fetchone() is not None
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
 
 
-def cancel_appointment_for_user(appointment_id, username):
+def is_appointment_slot_taken(doctor_name, appointment_date, appointment_slot):
     ensure_database_ready()
-    with get_database_connection() as conn:
-        cursor = conn.execute(
+    return is_appointment_slot_taken_in_mysql(doctor_name, appointment_date, appointment_slot)
+
+
+def cancel_appointment_for_user_in_mysql(appointment_id, username):
+    conn = get_mysql_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
             """
             UPDATE appointments
             SET status = 'Cancelled',
                 updated_at = CURRENT_TIMESTAMP
-            WHERE appointment_id = ?
-              AND username = ?
+            WHERE appointment_id = %s
+              AND username = %s
               AND status = 'Booked'
             """,
             (appointment_id, username),
         )
-    return cursor.rowcount > 0
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
+
+
+def cancel_appointment_for_user(appointment_id, username):
+    ensure_database_ready()
+    return cancel_appointment_for_user_in_mysql(appointment_id, username)
 
 
 def split_specialists(specialist_text):
@@ -12246,10 +12999,12 @@ def lab_appointment_row_to_dict(row):
     }
 
 
-def load_lab_appointments():
-    ensure_database_ready()
-    with get_database_connection() as conn:
-        rows = conn.execute(
+def load_lab_appointments_from_mysql():
+    conn = get_mysql_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
             """
             SELECT lab_appointment_id, username, patient_name, predicted_disease,
                    lab_name, lab_tests_json, total_amount, payment_method, payment_status,
@@ -12257,41 +13012,47 @@ def load_lab_appointments():
             FROM lab_appointments
             ORDER BY appointment_date DESC, appointment_slot DESC, booked_at DESC
             """
-        ).fetchall()
-    return [lab_appointment_row_to_dict(row) for row in rows]
+        )
+        return [lab_appointment_row_to_dict(row) for row in cursor.fetchall()]
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
 
 
-def save_lab_appointments(appointments):
-    ensure_database_ready()
-    with get_database_connection() as conn:
+def save_lab_appointments_to_mysql(appointments):
+    conn = get_mysql_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor()
         for appointment in appointments:
             appointment_id = str(appointment.get("lab_appointment_id", "")).strip()
             username = str(appointment.get("username", "")).strip().lower()
             if not appointment_id or not username:
                 continue
-            conn.execute(
+            cursor.execute(
                 """
                 INSERT INTO lab_appointments (
                     lab_appointment_id, username, patient_name, predicted_disease,
                     lab_name, lab_tests_json, total_amount, payment_method, payment_status,
                     appointment_date, appointment_slot, status, booked_at, symptoms_json,
                     payment_reference, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(lab_appointment_id) DO UPDATE SET
-                    username = excluded.username,
-                    patient_name = excluded.patient_name,
-                    predicted_disease = excluded.predicted_disease,
-                    lab_name = excluded.lab_name,
-                    lab_tests_json = excluded.lab_tests_json,
-                    total_amount = excluded.total_amount,
-                    payment_method = excluded.payment_method,
-                    payment_status = excluded.payment_status,
-                    appointment_date = excluded.appointment_date,
-                    appointment_slot = excluded.appointment_slot,
-                    status = excluded.status,
-                    booked_at = excluded.booked_at,
-                    symptoms_json = excluded.symptoms_json,
-                    payment_reference = excluded.payment_reference,
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON DUPLICATE KEY UPDATE
+                    username = VALUES(username),
+                    patient_name = VALUES(patient_name),
+                    predicted_disease = VALUES(predicted_disease),
+                    lab_name = VALUES(lab_name),
+                    lab_tests_json = VALUES(lab_tests_json),
+                    total_amount = VALUES(total_amount),
+                    payment_method = VALUES(payment_method),
+                    payment_status = VALUES(payment_status),
+                    appointment_date = VALUES(appointment_date),
+                    appointment_slot = VALUES(appointment_slot),
+                    status = VALUES(status),
+                    booked_at = VALUES(booked_at),
+                    symptoms_json = VALUES(symptoms_json),
+                    payment_reference = VALUES(payment_reference),
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -12312,45 +13073,83 @@ def save_lab_appointments(appointments):
                     str(appointment.get("payment_reference", "")).strip(),
                 ),
             )
+        conn.commit()
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
+
+
+def load_lab_appointments():
+    ensure_database_ready()
+    return load_lab_appointments_from_mysql()
+
+
+def save_lab_appointments(appointments):
+    ensure_database_ready()
+    save_lab_appointments_to_mysql(appointments)
 
 
 def save_lab_appointment(appointment):
     save_lab_appointments([appointment])
 
 
-def is_lab_appointment_slot_taken(lab_name, appointment_date, appointment_slot):
-    ensure_database_ready()
-    with get_database_connection() as conn:
-        row = conn.execute(
+def is_lab_appointment_slot_taken_in_mysql(lab_name, appointment_date, appointment_slot):
+    conn = get_mysql_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
             """
             SELECT 1
             FROM lab_appointments
-            WHERE lower(trim(lab_name)) = lower(trim(?))
-              AND appointment_date = ?
-              AND lower(trim(appointment_slot)) = lower(trim(?))
+            WHERE lower(trim(lab_name)) = lower(trim(%s))
+              AND appointment_date = %s
+              AND lower(trim(appointment_slot)) = lower(trim(%s))
               AND status = 'Booked'
             LIMIT 1
             """,
             (lab_name, appointment_date, appointment_slot),
-        ).fetchone()
-    return row is not None
+        )
+        return cursor.fetchone() is not None
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
 
 
-def cancel_lab_appointment_for_user(appointment_id, username):
+def is_lab_appointment_slot_taken(lab_name, appointment_date, appointment_slot):
     ensure_database_ready()
-    with get_database_connection() as conn:
-        cursor = conn.execute(
+    return is_lab_appointment_slot_taken_in_mysql(lab_name, appointment_date, appointment_slot)
+
+
+def cancel_lab_appointment_for_user_in_mysql(appointment_id, username):
+    conn = get_mysql_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
             """
             UPDATE lab_appointments
             SET status = 'Cancelled',
                 updated_at = CURRENT_TIMESTAMP
-            WHERE lab_appointment_id = ?
-              AND username = ?
+            WHERE lab_appointment_id = %s
+              AND username = %s
               AND status = 'Booked'
             """,
             (appointment_id, username),
         )
-    return cursor.rowcount > 0
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
+
+
+def cancel_lab_appointment_for_user(appointment_id, username):
+    ensure_database_ready()
+    return cancel_lab_appointment_for_user_in_mysql(appointment_id, username)
 
 
 def format_lab_appointment_rows(appointments):
@@ -12807,6 +13606,7 @@ def render_lab_diagnostic_center_search(care_plan, predicted_disease):
         key="lab_search_location",
     )
     typed_location = location_text.strip()
+    maps_key_token = get_map_provider_cache_token()
     city_suggestions = get_city_suggestions(location_text)
     selected_city = ""
     if len(normalize_location_query(location_text)) >= 2:
@@ -12847,7 +13647,8 @@ def render_lab_diagnostic_center_search(care_plan, predicted_disease):
         f"{normalize_location_query(search_location)}|"
         f"{normalize_disease_name(predicted_disease)}|"
         f"{care_plan.get('lab_test_required', '')}|"
-        f"{care_plan.get('blood_report_required', '')}"
+        f"{care_plan.get('blood_report_required', '')}|"
+        f"{maps_key_token}"
     )
     if st.session_state.lab_provider_location_fingerprint != current_lab_context:
         previous_lab_was_selected = bool(
@@ -12875,6 +13676,7 @@ def render_lab_diagnostic_center_search(care_plan, predicted_disease):
                     "Diagnostic Lab",
                     predicted_disease,
                     "labs",
+                    maps_key_token,
                 )
                 st.session_state.lab_provider_search_context = current_lab_context
 
@@ -12908,7 +13710,7 @@ def render_lab_diagnostic_center_search(care_plan, predicted_disease):
         render_provider_results(
             "Nearby Diagnostic Labs",
             labs,
-            "No named diagnostic lab listing was found in public map data for this area. Try a nearby larger city or enter the lab name manually.",
+            "No named diagnostic lab listing was found for this area. Try a nearby larger city or enter the lab name manually.",
         )
 
         if labs:
@@ -12931,7 +13733,7 @@ def render_lab_diagnostic_center_search(care_plan, predicted_disease):
                     f"Added {selected_lab_name} to the lab booking form."
                 )
         else:
-            st.info("No public named diagnostic lab listing was found. You can still enter the diagnostic center manually.")
+            st.info("No named diagnostic lab listing was found. You can still enter the diagnostic center manually.")
     elif len(normalize_location_query(search_location)) >= 2:
         st.caption("Click Find Diagnostic Labs to load nearby labs inside the Lab Tests page.")
 
@@ -13317,7 +14119,7 @@ def render_about():
     with status_col1:
         render_status_card(
             "Database persistence enabled",
-            "Users and appointments are stored in SQLite with automatic migration from the old JSON files.",
+            "Users and appointments are stored directly in MySQL.",
             label="Production Foundation",
         )
     with status_col2:
@@ -13641,7 +14443,7 @@ def render_prediction(model_metadata, preprocessing_data, label_encoder, feature
     with nav_col2:
         render_action_card(
             "Find Hospital",
-            "Nearby hospital listings are detected from the selected area.",
+            "Nearby hospital listings use public maps first, with optional fallback providers.",
             "sky",
         )
     with nav_col3:
@@ -13664,6 +14466,7 @@ def render_prediction(model_metadata, preprocessing_data, label_encoder, feature
             key="doctor_search_location",
         )
         typed_location = location_text.strip()
+        maps_key_token = get_map_provider_cache_token()
         city_suggestions = get_city_suggestions(location_text)
         selected_city = ""
         if len(normalize_location_query(location_text)) >= 2:
@@ -13701,7 +14504,7 @@ def render_prediction(model_metadata, preprocessing_data, label_encoder, feature
 
         search_location = selected_city or typed_location
         current_provider_context = (
-            f"{normalize_location_query(search_location)}|{care_plan['specialist']}|{predicted_disease}"
+            f"{normalize_location_query(search_location)}|{care_plan['specialist']}|{predicted_disease}|{maps_key_token}"
         )
         if st.session_state.provider_location_fingerprint != current_provider_context:
             previous_provider_was_selected = bool(
@@ -13745,6 +14548,7 @@ def render_prediction(model_metadata, preprocessing_data, label_encoder, feature
                         care_plan["specialist"],
                         predicted_disease,
                         "doctors",
+                        maps_key_token,
                     )
                     st.session_state.provider_search_context = current_provider_context
 
@@ -13758,6 +14562,7 @@ def render_prediction(model_metadata, preprocessing_data, label_encoder, feature
                         care_plan["specialist"],
                         predicted_disease,
                         "hospitals",
+                        maps_key_token,
                     )
                     st.session_state.provider_search_context = current_provider_context
 
@@ -13780,7 +14585,7 @@ def render_prediction(model_metadata, preprocessing_data, label_encoder, feature
                         f"Showing {html.escape(care_focus.lower())} listings near {html.escape(clean_provider_text(origin.get('display_name'), search_location))}. "
                         f"Source: {html.escape(provider_results.get('source', 'public map listings'))}."
                         f"{radius_sentence}"
-                        " Click a hospital card to open its map location."
+                        " Click a card to open its map location."
                         "</div>"
                     ),
                     unsafe_allow_html=True,
@@ -13792,7 +14597,7 @@ def render_prediction(model_metadata, preprocessing_data, label_encoder, feature
                 render_provider_results(
                     f"Recommended Hospitals for {predicted_disease}",
                     provider_results.get("hospitals", []),
-                    "No named hospital listing was found in public map data for this area. Try a nearby larger city or enter the hospital manually.",
+                    "No named hospital listing was found for this area. Try a nearby larger city or enter the hospital manually.",
                 )
                 render_provider_results(
                     f"Nearby Doctors and Clinics for {care_plan['specialist']}",
@@ -13808,7 +14613,7 @@ def render_prediction(model_metadata, preprocessing_data, label_encoder, feature
                 render_provider_results(
                     f"Recommended Hospitals for {predicted_disease}",
                     provider_results.get("hospitals", []),
-                    "No named hospital listing was found in public map data for this area. Try a nearby larger city or enter the hospital manually.",
+                    "No named hospital listing was found for this area. Try a nearby larger city or enter the hospital manually.",
                 )
 
             all_recommendations = provider_results.get("doctors", []) + provider_results.get("hospitals", [])
@@ -13837,7 +14642,7 @@ def render_prediction(model_metadata, preprocessing_data, label_encoder, feature
                         f"Added booking details from {selected_provider_name}. Fill any remaining blank field manually."
                     )
             else:
-                st.info("No public named listing was found. You can still enter doctor and hospital details manually.")
+                st.info("No named map listing was found. You can still enter doctor and hospital details manually.")
         elif len(normalize_location_query(search_location)) >= 2:
             st.caption("Click Search Doctors or Find Hospitals to load recommendations inside the dashboard.")
 
@@ -13845,7 +14650,7 @@ def render_prediction(model_metadata, preprocessing_data, label_encoder, feature
         if st.session_state.provider_autofill_notice and active_booking_provider:
             st.success(st.session_state.provider_autofill_notice)
 
-        st.info("Public listings may show clinic or hospital names when individual doctor names are not published. Selected listings are accepted as booking provider details.")
+        st.info("Map listings may show clinic or hospital names when individual doctor names are not published. Selected listings are accepted as booking provider details.")
 
         selected_doctor_name = st.text_input(
             "Doctor",

@@ -17,7 +17,7 @@ AI-powered disease screening dashboard with symptom chatbot, ML prediction, doct
 - Patient-friendly symptom chatbot and manual symptom picker.
 - Machine-learning prediction using trained model artifacts.
 - Care-plan guidance with severity, specialist, warning signs, home-care notes, and lab-test guidance.
-- Doctor and hospital search using public map listings.
+- Doctor and hospital search with OpenStreetMap/Photon/Overpass public listings, plus optional HERE fallback.
 - Separate Lab Tests section with diagnostic lab search, test cart, payment reference, and lab appointment booking.
 - Appointment page for doctor and lab-test bookings with cancellation support.
 - Light/dark theme UI and responsive Streamlit dashboard.
@@ -43,7 +43,7 @@ It explains:
 - Chatbot flow
 - Doctor, hospital, and diagnostic lab search
 - Lab-test booking and payment-reference flow
-- SQLite/JSON storage design
+- MySQL storage design
 - Deployment notes
 
 ## Quick Start
@@ -150,6 +150,7 @@ The dashboard loads trained pickle artifacts; it does not automatically retrain 
 ## Features
 
 - Secure local login/register flow with hashed passwords.
+- MySQL storage for users, doctor appointments, and lab appointments.
 - Light and dark theme support.
 - Patient-facing symptom chatbot.
 - Manual symptom picker.
@@ -163,7 +164,7 @@ The dashboard loads trained pickle artifacts; it does not automatically retrain 
 
 ## Diagnostic Lab Search
 
-The Lab Tests page can search diagnostic labs by city or area. It uses public OpenStreetMap/Photon listings and shows nearby diagnostic labs when public data is available.
+The Lab Tests page can search diagnostic labs by city or area. It uses public Photon/OpenStreetMap listings first, then optional HERE fallback if `HERE_API_KEY` is configured.
 
 The selected diagnostic lab is automatically filled into the lab booking form.
 
@@ -171,13 +172,39 @@ The selected diagnostic lab is automatically filled into the lab booking form.
 
 Do not commit real API keys to GitHub.
 
-For Gemini chatbot support, put the key in:
+For Gemini chatbot support and optional map fallbacks, put keys in:
 
 ```text
 .streamlit/secrets.toml
 ```
 
 Use deployment platform secrets for hosted deployment.
+
+Required/optional secret names:
+
+```text
+GEMINI_API_KEY=replace-with-your-gemini-key
+HERE_API_KEY=optional-here-api-key
+MAPBOX_ACCESS_TOKEN=optional-mapbox-access-token
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_DATABASE=disease_prediction
+MYSQL_USER=root
+MYSQL_PASSWORD=replace-with-your-mysql-password
+```
+
+Map fallback behavior:
+
+- No map key: uses OpenStreetMap Nominatim, Photon, and Overpass public listings.
+- `HERE_API_KEY`: adds fallback doctor, hospital, and diagnostic lab place search.
+- `MAPBOX_ACCESS_TOKEN`: adds fallback city/area geocoding when public geocoding fails.
+
+Required MySQL app storage:
+
+- Create a MySQL database, for example `disease_prediction`.
+- Add `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, and `MYSQL_PASSWORD` to `.streamlit/secrets.toml` or deployment secrets.
+- Register/login/password reset, doctor bookings, and lab bookings use MySQL only.
+- The app will stop with a clear configuration error if MySQL credentials are missing or MySQL is unreachable.
 
 ## Deployment Checklist
 
@@ -195,7 +222,7 @@ For Streamlit Cloud:
 
 - Main file path: `s06_dash.py`
 - Dependencies: `requirements.txt`
-- Secrets: configure `GEMINI_API_KEY` only in platform secrets
+- Secrets: configure `GEMINI_API_KEY`; optionally add `HERE_API_KEY`, `MAPBOX_ACCESS_TOKEN`, and MySQL credentials
 
 ## Medical Safety Note
 
