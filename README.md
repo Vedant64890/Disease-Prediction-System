@@ -191,6 +191,13 @@ MYSQL_PORT=3306
 MYSQL_DATABASE=disease_prediction
 MYSQL_USER=root
 MYSQL_PASSWORD=replace-with-your-mysql-password
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASSWORD=replace-with-your-email-app-password
+SMTP_FROM_EMAIL=your-email@gmail.com
+SMTP_FROM_NAME=Disease Prediction System
+SMTP_USE_TLS=true
 ```
 
 Map fallback behavior:
@@ -203,8 +210,15 @@ Required MySQL app storage:
 
 - Create a MySQL database, for example `disease_prediction`.
 - Add `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, and `MYSQL_PASSWORD` to `.streamlit/secrets.toml` or deployment secrets.
-- Register/login/password reset, doctor bookings, and lab bookings use MySQL only.
+- Register/login/password reset, account email addresses, doctor bookings, and lab bookings use MySQL only.
 - The app will stop with a clear configuration error if MySQL credentials are missing or MySQL is unreachable.
+
+Appointment email confirmations:
+
+- New registrations require an email address.
+- Doctor and lab appointments are saved first, then the app emails the booking details to the registered email address.
+- Add the `SMTP_*` secrets above to enable delivery. Gmail requires an app password, not the normal account password.
+- If SMTP is not configured or delivery fails, the appointment remains saved and the UI shows a warning.
 
 ## Deployment Checklist
 

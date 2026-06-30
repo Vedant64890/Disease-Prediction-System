@@ -7,7 +7,10 @@ import json
 import os
 import pickle
 import re
+import smtplib
 from datetime import date, datetime, timedelta
+from email.message import EmailMessage
+from email.utils import formataddr
 from math import asin, cos, radians, sin, sqrt
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, urlencode
@@ -291,7 +294,17 @@ def verify_password(password, stored_hash):
     return hmac.compare_digest(legacy, stored_hash)
 
 
+def normalize_email_address(email):
+    return str(email or "").strip().lower()
+
+
+def is_valid_email_address(email):
+    normalized_email = normalize_email_address(email)
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized_email))
+
+
 _database_ready = False
+MYSQL_READ_CACHE_TTL_SECONDS = 15
 
 
 def get_configured_secret_value(*names):
@@ -308,6 +321,83 @@ def get_configured_secret_value(*names):
         if secret_value is not None and str(secret_value).strip():
             return str(secret_value).strip()
     return ""
+
+
+def parse_secret_bool(value, default=False):
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def get_smtp_config():
+    host = get_configured_secret_value("SMTP_HOST", "EMAIL_SMTP_HOST")
+    user = get_configured_secret_value("SMTP_USER", "SMTP_USERNAME", "EMAIL_USER", "EMAIL_USERNAME")
+    password = get_configured_secret_value("SMTP_PASSWORD", "SMTP_PASS", "EMAIL_PASSWORD")
+    from_email = normalize_email_address(
+        get_configured_secret_value("SMTP_FROM_EMAIL", "SMTP_FROM", "EMAIL_FROM") or user
+    )
+    from_name = get_configured_secret_value("SMTP_FROM_NAME", "EMAIL_FROM_NAME") or "Disease Prediction System"
+
+    port_value = get_configured_secret_value("SMTP_PORT", "EMAIL_SMTP_PORT") or "587"
+    try:
+        port = int(port_value)
+    except (TypeError, ValueError):
+        port = 587
+
+    use_ssl_value = get_configured_secret_value("SMTP_USE_SSL", "EMAIL_USE_SSL")
+    use_ssl = parse_secret_bool(use_ssl_value, default=(port == 465))
+    use_tls_value = get_configured_secret_value("SMTP_USE_TLS", "EMAIL_USE_TLS")
+    use_tls = parse_secret_bool(use_tls_value, default=not use_ssl)
+
+    return {
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+        "from_email": from_email,
+        "from_name": from_name,
+        "use_ssl": use_ssl,
+        "use_tls": use_tls,
+    }
+
+
+def send_plain_email(to_email, subject, body):
+    recipient = normalize_email_address(to_email)
+    if not recipient:
+        return False, "No email address is saved for this account."
+    if not is_valid_email_address(recipient):
+        return False, "The saved account email address is not valid."
+
+    config = get_smtp_config()
+    if not config["host"] or not config["from_email"]:
+        return False, "Email delivery is not configured. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and SMTP_FROM_EMAIL."
+    if config["user"] and not config["password"]:
+        return False, "SMTP_PASSWORD is missing. For Gmail, create an app password and add it to .streamlit/secrets.toml."
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = formataddr((config["from_name"], config["from_email"]))
+    message["To"] = recipient
+    message.set_content(body)
+
+    try:
+        if config["use_ssl"]:
+            with smtplib.SMTP_SSL(config["host"], config["port"], timeout=12) as smtp:
+                if config["user"] and config["password"]:
+                    smtp.login(config["user"], config["password"])
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(config["host"], config["port"], timeout=12) as smtp:
+                smtp.ehlo()
+                if config["use_tls"]:
+                    smtp.starttls()
+                    smtp.ehlo()
+                if config["user"] and config["password"]:
+                    smtp.login(config["user"], config["password"])
+                smtp.send_message(message)
+        return True, ""
+    except Exception as exc:
+        return False, f"Email delivery failed: {exc}"
 
 
 def get_mysql_database_config():
@@ -331,6 +421,14 @@ def get_mysql_database_config():
         "user": user,
         "password": password,
     }
+
+
+def get_mysql_config_cache_token():
+    config = get_mysql_database_config()
+    if not config:
+        return "mysql-not-configured"
+    safe_config = {**config, "password": hashlib.sha256(config["password"].encode("utf-8")).hexdigest()}
+    return hashlib.sha256(json.dumps(safe_config, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def get_mysql_user_database_config():
@@ -368,7 +466,24 @@ def get_mysql_user_connection():
     return get_mysql_connection()
 
 
-def initialize_mysql_storage():
+def ensure_mysql_column(cursor, table_name, column_name, column_definition):
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND COLUMN_NAME = %s
+        """,
+        (table_name, column_name),
+    )
+    row = cursor.fetchone()
+    column_exists = bool(row and row[0])
+    if not column_exists:
+        cursor.execute(f"ALTER TABLE `{table_name}` ADD COLUMN {column_definition}")
+
+
+def initialize_mysql_storage_uncached():
     if not mysql_storage_enabled():
         return
 
@@ -382,12 +497,14 @@ def initialize_mysql_storage():
                 username VARCHAR(120) PRIMARY KEY,
                 first_name VARCHAR(120) NOT NULL,
                 last_name VARCHAR(120) NOT NULL,
+                email VARCHAR(255) NOT NULL DEFAULT '',
                 password_hash VARCHAR(255) NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """
         )
+        ensure_mysql_column(cursor, "users", "email", "email VARCHAR(255) NOT NULL DEFAULT '' AFTER last_name")
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS appointments (
@@ -442,18 +559,28 @@ def initialize_mysql_storage():
         conn.close()
 
 
+@st.cache_resource(show_spinner=False)
+def initialize_mysql_storage_cached(config_token):
+    initialize_mysql_storage_uncached()
+    return True
+
+
+def initialize_mysql_storage():
+    initialize_mysql_storage_cached(get_mysql_config_cache_token())
+
+
 def initialize_mysql_user_storage():
     initialize_mysql_storage()
 
 
-def load_users_from_mysql():
+def load_users_from_mysql_uncached():
     conn = get_mysql_user_connection()
     cursor = None
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
             """
-            SELECT username, first_name, last_name, password_hash
+            SELECT username, first_name, last_name, email, password_hash
             FROM users
             ORDER BY username
             """
@@ -463,6 +590,7 @@ def load_users_from_mysql():
             row["username"]: {
                 "first_name": row["first_name"],
                 "last_name": row["last_name"],
+                "email": row.get("email", ""),
                 "username": row["username"],
                 "password_hash": row["password_hash"],
             }
@@ -472,6 +600,15 @@ def load_users_from_mysql():
         if cursor is not None:
             cursor.close()
         conn.close()
+
+
+@st.cache_data(ttl=MYSQL_READ_CACHE_TTL_SECONDS, show_spinner=False)
+def load_users_from_mysql_cached(config_token):
+    return load_users_from_mysql_uncached()
+
+
+def load_users_from_mysql():
+    return load_users_from_mysql_cached(get_mysql_config_cache_token())
 
 
 def save_users_to_mysql(users):
@@ -486,11 +623,12 @@ def save_users_to_mysql(users):
             cursor.execute(
                 """
                 INSERT INTO users (
-                    username, first_name, last_name, password_hash, updated_at
-                ) VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    username, first_name, last_name, email, password_hash, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                 ON DUPLICATE KEY UPDATE
                     first_name = VALUES(first_name),
                     last_name = VALUES(last_name),
+                    email = VALUES(email),
                     password_hash = VALUES(password_hash),
                     updated_at = CURRENT_TIMESTAMP
                 """,
@@ -498,10 +636,12 @@ def save_users_to_mysql(users):
                     username_key,
                     str(user.get("first_name", "")).strip(),
                     str(user.get("last_name", "")).strip(),
+                    normalize_email_address(user.get("email", "")),
                     str(user.get("password_hash", "")).strip(),
                 ),
             )
         conn.commit()
+        load_users_from_mysql_cached.clear()
     finally:
         if cursor is not None:
             cursor.close()
@@ -12699,7 +12839,7 @@ def appointment_row_to_dict(row):
     }
 
 
-def load_appointments_from_mysql():
+def load_appointments_from_mysql_uncached():
     conn = get_mysql_connection()
     cursor = None
     try:
@@ -12718,6 +12858,15 @@ def load_appointments_from_mysql():
         if cursor is not None:
             cursor.close()
         conn.close()
+
+
+@st.cache_data(ttl=MYSQL_READ_CACHE_TTL_SECONDS, show_spinner=False)
+def load_appointments_from_mysql_cached(config_token):
+    return load_appointments_from_mysql_uncached()
+
+
+def load_appointments_from_mysql():
+    return load_appointments_from_mysql_cached(get_mysql_config_cache_token())
 
 
 def save_appointments_to_mysql(appointments):
@@ -12771,6 +12920,7 @@ def save_appointments_to_mysql(appointments):
                 ),
             )
         conn.commit()
+        load_appointments_from_mysql_cached.clear()
     finally:
         if cursor is not None:
             cursor.close()
@@ -12837,7 +12987,10 @@ def cancel_appointment_for_user_in_mysql(appointment_id, username):
             (appointment_id, username),
         )
         conn.commit()
-        return cursor.rowcount > 0
+        cancelled = cursor.rowcount > 0
+        if cancelled:
+            load_appointments_from_mysql_cached.clear()
+        return cancelled
     finally:
         if cursor is not None:
             cursor.close()
@@ -12861,6 +13014,103 @@ def build_appointment_id():
 def build_lab_appointment_id():
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
     return f"LAB-{timestamp}"
+
+
+def format_email_value(value, fallback="Not provided"):
+    return clean_provider_text(value, fallback)
+
+
+def format_email_list(values, fallback="Not provided"):
+    cleaned_values = []
+    for value in values or []:
+        cleaned = clean_provider_text(value)
+        if cleaned:
+            cleaned_values.append(cleaned)
+    return ", ".join(cleaned_values) if cleaned_values else fallback
+
+
+def format_lab_tests_for_email(lab_tests):
+    lines = []
+    for item in lab_tests or []:
+        test_name = clean_provider_text(item.get("Test", ""), "Lab test")
+        price = clean_provider_number(item.get("Estimated Price", 0), 0)
+        if price:
+            lines.append(f"- {test_name}: INR {price:,.0f}")
+        else:
+            lines.append(f"- {test_name}")
+    return "\n".join(lines) if lines else "Not provided"
+
+
+def build_doctor_appointment_email(appointment):
+    appointment_id = format_email_value(appointment.get("appointment_id"))
+    patient_name = format_email_value(appointment.get("patient_name"), "Patient")
+    subject = f"Doctor appointment booked - {appointment_id}"
+    body = f"""Hello {patient_name},
+
+Your doctor appointment has been booked.
+
+Appointment ID: {appointment_id}
+Doctor: {format_email_value(appointment.get("doctor_name"))}
+Hospital/Clinic: {format_email_value(appointment.get("hospital"))}
+Specialist: {format_email_value(appointment.get("specialist"))}
+Mode: {format_email_value(appointment.get("consultation_mode"))}
+Date: {format_email_value(appointment.get("appointment_date"))}
+Time: {format_email_value(appointment.get("appointment_slot"))}
+Reason: {format_email_value(appointment.get("reason"))}
+Prediction Context: {format_email_value(appointment.get("predicted_disease"))}
+Symptoms: {format_email_list(appointment.get("symptoms"))}
+Booked On: {format_email_value(appointment.get("booked_at"))}
+
+Please confirm availability, location, fees, and required documents directly with the provider before visiting.
+If symptoms become severe or suddenly worse, seek urgent medical care.
+
+Disease Prediction System
+"""
+    return subject, body
+
+
+def build_lab_appointment_email(appointment):
+    appointment_id = format_email_value(appointment.get("lab_appointment_id"))
+    patient_name = format_email_value(appointment.get("patient_name"), "Patient")
+    subject = f"Lab appointment booked - {appointment_id}"
+    body = f"""Hello {patient_name},
+
+Your lab appointment has been booked.
+
+Lab Appointment ID: {appointment_id}
+Diagnostic Lab: {format_email_value(appointment.get("lab_name"))}
+Date: {format_email_value(appointment.get("appointment_date"))}
+Time: {format_email_value(appointment.get("appointment_slot"))}
+Tests:
+{format_lab_tests_for_email(appointment.get("lab_tests"))}
+
+Estimated Total: INR {float(appointment.get("total_amount", 0) or 0):,.0f}
+Payment Method: {format_email_value(appointment.get("payment_method"))}
+Payment Status: {format_email_value(appointment.get("payment_status"))}
+Payment Reference: {format_email_value(appointment.get("payment_reference"))}
+Prediction Context: {format_email_value(appointment.get("predicted_disease"))}
+Symptoms: {format_email_list(appointment.get("symptoms"))}
+Booked On: {format_email_value(appointment.get("booked_at"))}
+
+Please confirm availability, location, final price, and sample requirements directly with the diagnostic center before visiting.
+If symptoms become severe or suddenly worse, seek urgent medical care.
+
+Disease Prediction System
+"""
+    return subject, body
+
+
+def send_appointment_confirmation_email(current_user, appointment, appointment_type):
+    recipient = normalize_email_address((current_user or {}).get("email", ""))
+    if appointment_type == "lab":
+        subject, body = build_lab_appointment_email(appointment)
+    else:
+        subject, body = build_doctor_appointment_email(appointment)
+
+    sent, message = send_plain_email(recipient, subject, body)
+    if sent:
+        return True, f"Appointment details were sent to {recipient}."
+    return False, message
 
 
 LAB_TEST_PRICE_RULES = (
@@ -12999,7 +13249,7 @@ def lab_appointment_row_to_dict(row):
     }
 
 
-def load_lab_appointments_from_mysql():
+def load_lab_appointments_from_mysql_uncached():
     conn = get_mysql_connection()
     cursor = None
     try:
@@ -13018,6 +13268,15 @@ def load_lab_appointments_from_mysql():
         if cursor is not None:
             cursor.close()
         conn.close()
+
+
+@st.cache_data(ttl=MYSQL_READ_CACHE_TTL_SECONDS, show_spinner=False)
+def load_lab_appointments_from_mysql_cached(config_token):
+    return load_lab_appointments_from_mysql_uncached()
+
+
+def load_lab_appointments_from_mysql():
+    return load_lab_appointments_from_mysql_cached(get_mysql_config_cache_token())
 
 
 def save_lab_appointments_to_mysql(appointments):
@@ -13074,6 +13333,7 @@ def save_lab_appointments_to_mysql(appointments):
                 ),
             )
         conn.commit()
+        load_lab_appointments_from_mysql_cached.clear()
     finally:
         if cursor is not None:
             cursor.close()
@@ -13140,7 +13400,10 @@ def cancel_lab_appointment_for_user_in_mysql(appointment_id, username):
             (appointment_id, username),
         )
         conn.commit()
-        return cursor.rowcount > 0
+        cancelled = cursor.rowcount > 0
+        if cancelled:
+            load_lab_appointments_from_mysql_cached.clear()
+        return cancelled
     finally:
         if cursor is not None:
             cursor.close()
@@ -13414,31 +13677,35 @@ def render_lab_test_booking_section(care_plan, predicted_disease, selected_sympt
         lab_appointment_id = build_lab_appointment_id()
         payment_status = "Online reference saved" if payment_method == "Online" else "Cash pending at lab"
 
-        save_lab_appointment(
-            {
-                "lab_appointment_id": lab_appointment_id,
-                "username": username,
-                "patient_name": patient_name,
-                "predicted_disease": predicted_disease,
-                "lab_name": lab_name.strip(),
-                "lab_tests": booking_tests,
-                "total_amount": booking_total,
-                "payment_method": payment_method,
-                "payment_status": payment_status,
-                "appointment_date": appointment_date_value,
-                "appointment_slot": lab_slot.strip(),
-                "status": "Booked",
-                "booked_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "symptoms": [format_symptom_label(symptom) for symptom in selected_symptoms],
-                "payment_reference": payment_reference.strip(),
-            }
-        )
+        lab_appointment = {
+            "lab_appointment_id": lab_appointment_id,
+            "username": username,
+            "patient_name": patient_name,
+            "predicted_disease": predicted_disease,
+            "lab_name": lab_name.strip(),
+            "lab_tests": booking_tests,
+            "total_amount": booking_total,
+            "payment_method": payment_method,
+            "payment_status": payment_status,
+            "appointment_date": appointment_date_value,
+            "appointment_slot": lab_slot.strip(),
+            "status": "Booked",
+            "booked_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "symptoms": [format_symptom_label(symptom) for symptom in selected_symptoms],
+            "payment_reference": payment_reference.strip(),
+        }
+        save_lab_appointment(lab_appointment)
         st.session_state.lab_test_cart = []
         st.session_state.lab_booking_notice = (
             f"Lab appointment {lab_appointment_id} booked at {lab_name.strip()} "
             f"on {appointment_date_value} at {lab_slot.strip()}."
         )
         st.success(st.session_state.lab_booking_notice)
+        email_sent, email_message = send_appointment_confirmation_email(current_user, lab_appointment, "lab")
+        if email_sent:
+            st.info(email_message)
+        else:
+            st.warning(f"Lab appointment saved, but email was not sent: {email_message}")
 
     current_user = st.session_state.current_user or {}
     username = current_user.get("username", "").strip().lower()
@@ -14142,6 +14409,7 @@ def render_register():
         with st.form("register_form", clear_on_submit=True):
             first_name = st.text_input("First Name")
             last_name = st.text_input("Last Name")
+            email = st.text_input("Email Address", placeholder="you@example.com")
             username = st.text_input("Username")
             password = st.text_input("Password", type="password")
             confirm_password = st.text_input("Confirm Password", type="password")
@@ -14155,13 +14423,18 @@ def render_register():
         )
         render_info_card(
             "Quick Tip",
-            "Use a memorable username and a strong password to return to your appointments later.",
+            "Use a real email address because appointment confirmations are sent there after booking.",
             kicker="Best Practice",
         )
 
     if submitted:
-        if not all([first_name.strip(), last_name.strip(), username.strip(), password, confirm_password]):
+        email_value = normalize_email_address(email)
+        if not all([first_name.strip(), last_name.strip(), email_value, username.strip(), password, confirm_password]):
             st.error("Please fill all fields.")
+            return
+
+        if not is_valid_email_address(email_value):
+            st.error("Please enter a valid email address.")
             return
 
         if password != confirm_password:
@@ -14178,6 +14451,7 @@ def render_register():
         users[user_key] = {
             "first_name": first_name.strip(),
             "last_name": last_name.strip(),
+            "email": email_value,
             "username": username.strip(),
             "password_hash": hash_password(password),
         }
@@ -14731,27 +15005,31 @@ def render_prediction(model_metadata, preprocessing_data, label_encoder, feature
                 st.error("That time slot has already been booked. Please choose another slot.")
             else:
                 appointment_id = build_appointment_id()
-                save_appointment(
-                    {
-                        "appointment_id": appointment_id,
-                        "username": username,
-                        "patient_name": patient_name,
-                        "predicted_disease": predicted_disease,
-                        "specialist": care_plan["specialist"],
-                        "doctor_name": booking_doctor_name,
-                        "hospital": booking_hospital_name,
-                        "consultation_mode": booking_mode,
-                        "appointment_date": appointment_date_value,
-                        "appointment_slot": booking_slot.strip(),
-                        "status": "Booked",
-                        "booked_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "symptoms": [format_symptom_label(symptom) for symptom in selected_symptoms],
-                        "reason": booking_reason.strip(),
-                    }
-                )
+                appointment = {
+                    "appointment_id": appointment_id,
+                    "username": username,
+                    "patient_name": patient_name,
+                    "predicted_disease": predicted_disease,
+                    "specialist": care_plan["specialist"],
+                    "doctor_name": booking_doctor_name,
+                    "hospital": booking_hospital_name,
+                    "consultation_mode": booking_mode,
+                    "appointment_date": appointment_date_value,
+                    "appointment_slot": booking_slot.strip(),
+                    "status": "Booked",
+                    "booked_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "symptoms": [format_symptom_label(symptom) for symptom in selected_symptoms],
+                    "reason": booking_reason.strip(),
+                }
+                save_appointment(appointment)
                 st.success(
                     f"Appointment saved with {booking_doctor_name} on {appointment_date_value} at {booking_slot.strip()}. Appointment ID: {appointment_id}"
                 )
+                email_sent, email_message = send_appointment_confirmation_email(current_user, appointment, "doctor")
+                if email_sent:
+                    st.info(email_message)
+                else:
+                    st.warning(f"Appointment saved, but email was not sent: {email_message}")
 
         current_user = st.session_state.current_user or {}
         username = current_user.get("username", "").strip().lower()

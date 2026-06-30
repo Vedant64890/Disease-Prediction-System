@@ -74,7 +74,7 @@ In Streamlit Community Cloud:
 1. Select the GitHub repository and branch.
 2. Set the main file path to `s06_dash.py`.
 3. In Advanced settings, choose a Python version compatible with the project, such as Python 3.11 or 3.12.
-4. Paste the secret values from `.streamlit/secrets.example.toml`, replacing the placeholders with the real Gemini key and any optional map fallback keys.
+4. Paste the secret values from `.streamlit/secrets.example.toml`, replacing the placeholders with the real Gemini key, MySQL credentials, optional map fallback keys, and optional SMTP email credentials.
 5. Deploy and watch the build logs for dependency or missing-file errors.
 
 ## Environment Variables
@@ -91,4 +91,13 @@ MYSQL_PORT=3306
 MYSQL_DATABASE=disease_prediction
 MYSQL_USER=root
 MYSQL_PASSWORD=replace-with-your-mysql-password
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASSWORD=replace-with-your-email-app-password
+SMTP_FROM_EMAIL=your-email@gmail.com
+SMTP_FROM_NAME=Disease Prediction System
+SMTP_USE_TLS=true
 ```
+
+SMTP settings are optional for running the app, but required if booked doctor or lab appointment details should be emailed to the user's registered address. Gmail accounts must use an app password.
